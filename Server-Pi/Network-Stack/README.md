@@ -7,16 +7,16 @@ This folder focuses on the Server that runs on the Jetson (or other onboard comp
 
 ---
 
-## Quick start — Server (Jetson)
+## Quick start — Server (Raspberry Pi)
 
-Build (on Jetson or cross-compile):
+Build (on Pi or cross-compile):
 
 ```bash
-cd jetson-server
+cd Server-Pi
 go build -o server_bin .
 
 # or from repo root
-go build -o bin/jetson-server ./jetson-server
+go build -o bin/Server-Pi ./Server-Pi
 ```
 
 Run (example):
