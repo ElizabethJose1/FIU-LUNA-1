@@ -1,7 +1,8 @@
-#define _POSIX_C_SOURCE 2024L // defines the POSIX version, most recent, to implement clock_gettime() function for millis() implementation
+#define _POSIX_C_SOURCE 200809L // defines the POSIX version, most recent, to implement clock_gettime() function for millis() implementation
 #include <stdint.h>
 #include <stdio.h>
 #include <time.h>
+#include <unistd.h>
 
 enum RoverState{
   IDLE,//0
@@ -9,16 +10,19 @@ enum RoverState{
   AUTO//2
 }; // think of enum as describing ints with names EX: RED = 0
 
-int currentState = IDLE;// the enum object creation, system will start in IDLE state in the setup() stage
-unsigned long stateStartTime = 0;
-unsigned long lastPrintTime = 0;
+enum RoverState currentState = IDLE;// the enum object creation, system will start in IDLE state in the setup() stage
+long stateStartTime = 0;
+long lastPrintTime = 0;
 
-const unsigned long printInterval = 2500; // how often to print the remaining time in milliseconds, in this case every second
+const long printInterval = 2500; // how often to print the remaining time in milliseconds, in this case every second
 
 // writing functions because the functions must be above the setup and loop
 
-millis() {
-
+long millis() {
+  struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000LL +
+           ts.tv_nsec / 1000000LL;
 }
 
 void changeState(enum RoverState newState){ // newState is just another instance for the rover state in function that is used in this function to change the state
@@ -29,6 +33,7 @@ void changeState(enum RoverState newState){ // newState is just another instance
   switch (currentState){
     case IDLE:
       printf("IDLE\n");
+      fflush(stdout);
       break;
     case TELEOP:
 
@@ -40,16 +45,18 @@ void changeState(enum RoverState newState){ // newState is just another instance
 } 
 
 void setup() {
-  
+      changeState(IDLE);
 }
 
 void loop() {
-  unsigned long now = millis(); //how long the program has been running minus the time when the state started which atp is 0 with stateStartTime updated every time the state changes.
+  long now = millis(); //how long the program has been running minus the time when the state started which atp is 0 with stateStartTime updated every time the state changes.
 
   switch(currentState){
     case IDLE:
-      if (now - lastPrintTime >= printInterval)
-          lastPrintTime = now;
+      if (now - lastPrintTime >= printInterval){
+        printf("IDLE tick: %ld ms\n", now);
+        fflush(stdout);
+        lastPrintTime = now;}
       break;
 
     case TELEOP:
