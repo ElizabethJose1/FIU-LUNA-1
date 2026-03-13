@@ -34,6 +34,8 @@ const (
 	ABS_X     = 0x00
 	ABS_Y     = 0x01
 	ABS_Z     = 0x02
+	ABS_RX    = 0x03
+	ABS_RY    = 0x04
 	ABS_RZ    = 0x05
 	ABS_HAT0X = 0x10
 	ABS_HAT0Y = 0x11
@@ -85,8 +87,9 @@ type ControllerState struct {
 }
 
 func (c *ControllerState) String() string {
-	return fmt.Sprintf("Btns[N:%d E:%d S:%d W:%d] Joy[LX:%d LY:%d RX:%d RY:%d] Trig[L:%d R:%d] DPad[%d,%d]",
+	return fmt.Sprintf("Btns[N:%d E:%d S:%d W:%d LB:%d RB:%d SEL:%d START:%d] Joy[LX:%d LY:%d RX:%d RY:%d] Trig[L:%d R:%d] DPad[%d,%d]",
 		c.North, c.East, c.South, c.West,
+		c.LeftBumper, c.RightBumper, c.Select, c.Start,
 		c.LeftX, c.LeftY, c.RightX, c.RightY,
 		c.LeftTrigger, c.RightTrigger,
 		c.DPadX, c.DPadY)
@@ -126,7 +129,7 @@ func evioCGAbs(axis uint) uintptr {
 	ioc := func(dir, typ, nr, size uintptr) uintptr {
 		return (dir << iocDirshift) | (typ << iocTypeshift) | (nr << 0) | (size << iocSizeshift)
 	}
-	return ioc(iocRead, 0x45, 0x40+axis, unsafe.Sizeof(absInfo{}))
+	return ioc(iocRead, 0x45, uintptr(0x40)+uintptr(axis), unsafe.Sizeof(absInfo{}))
 }
 
 type evdevDevice struct {
@@ -134,6 +137,7 @@ type evdevDevice struct {
 	path     string
 	absCache map[uint16]absInfo
 	yNorth   bool
+	debug    bool
 }
 
 // normalize like your Python AxisEvent: ((value-min)/(max-min))*255 :contentReference[oaicite:8]{index=8}
@@ -170,7 +174,7 @@ func (d *evdevDevice) normalizeAbs(code uint16, v int32) (uint8, bool) {
 	return uint8(norm), true
 }
 
-func openEvdev(path string, yNorth bool) (*evdevDevice, error) {
+func openEvdev(path string, yNorth bool, debug bool) (*evdevDevice, error) {
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
@@ -180,7 +184,18 @@ func openEvdev(path string, yNorth bool) (*evdevDevice, error) {
 		path:     path,
 		absCache: make(map[uint16]absInfo),
 		yNorth:   yNorth,
+		debug:    debug,
 	}, nil
+}
+
+func readDeviceName(path string) string {
+	base := filepath.Base(path)
+	namePath := filepath.Join("/sys/class/input", base, "device/name")
+	data, err := os.ReadFile(namePath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func (d *evdevDevice) close() {
@@ -206,19 +221,39 @@ func (d *evdevDevice) readEvent() (inputEvent, bool, error) {
 
 // findEvdevController picks the first /dev/input/event* that can be opened.
 // (Barebones heuristic—good enough for first draft. You can tighten later.)
-func findEvdevController(yNorth bool) (*evdevDevice, error) {
+func findEvdevController(yNorth bool, debug bool) (*evdevDevice, error) {
 	paths, err := filepath.Glob("/dev/input/event*")
 	if err != nil || len(paths) == 0 {
 		return nil, fmt.Errorf("no /dev/input/event* devices found")
 	}
 	for _, p := range paths {
-		d, err := openEvdev(p, yNorth)
+		d, err := openEvdev(p, yNorth, debug)
 		if err == nil {
-			log.Printf("Using evdev device: %s", p)
+			name := readDeviceName(p)
+			if name != "" {
+				log.Printf("Using evdev device: %s (%s)", p, name)
+			} else {
+				log.Printf("Using evdev device: %s", p)
+			}
 			return d, nil
 		}
 	}
 	return nil, fmt.Errorf("could not open any /dev/input/event*")
+}
+
+func writeAll(conn net.Conn, buf []byte) error {
+	written := 0
+	for written < len(buf) {
+		n, err := conn.Write(buf[written:])
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("tcp write returned 0 bytes")
+		}
+		written += n
+	}
+	return nil
 }
 
 // readController maintains your same “ticker send loop”, but pulls freshest state from evdev
@@ -272,19 +307,22 @@ func readController(dev *evdevDevice, conn net.Conn) error {
 				if !isAnalog {
 					continue
 				}
+				if dev.debug {
+					log.Printf("ABS code=0x%X value=%d norm=%d", code, val, norm)
+				}
 
 				switch code {
 				case ABS_X:
 					state.LeftX = norm
 				case ABS_Y:
 					state.LeftY = norm
-				case ABS_Z:
+				case ABS_RX:
 					state.RightX = norm
-				case ABS_RZ:
+				case ABS_RY:
 					state.RightY = norm
-				case ABS_BRAKE:
+				case ABS_Z, ABS_BRAKE:
 					state.LeftTrigger = norm
-				case ABS_GAS:
+				case ABS_RZ, ABS_GAS:
 					state.RightTrigger = norm
 				}
 
@@ -293,6 +331,9 @@ func readController(dev *evdevDevice, conn net.Conn) error {
 				pressed := uint8(0)
 				if ev.Value != 0 {
 					pressed = 1
+				}
+				if dev.debug {
+					log.Printf("KEY code=0x%X value=%d", code, ev.Value)
 				}
 
 				// Optional X/Y swap behavior like your Python ButtonEvent(y_north=True) :contentReference[oaicite:12]{index=12}
@@ -345,10 +386,10 @@ func readController(dev *evdevDevice, conn net.Conn) error {
 		hdr := make([]byte, 4)
 		binary.BigEndian.PutUint32(hdr, uint32(len(pkt)))
 
-		if _, err := conn.Write(hdr); err != nil {
+		if err := writeAll(conn, hdr); err != nil {
 			return fmt.Errorf("write header: %w", err)
 		}
-		if _, err := conn.Write(pkt); err != nil {
+		if err := writeAll(conn, pkt); err != nil {
 			return fmt.Errorf("write packet: %w", err)
 		}
 
@@ -358,7 +399,7 @@ func readController(dev *evdevDevice, conn net.Conn) error {
 	return nil
 }
 
-func runClient(serverAddr string, yNorth bool) error {
+func runClient(serverAddr string, yNorth bool, debug bool) error {
 	conn, err := net.Dial("tcp", serverAddr)
 	if err != nil {
 		return err
@@ -368,7 +409,7 @@ func runClient(serverAddr string, yNorth bool) error {
 	log.Println("Connected to server")
 
 	for {
-		dev, err := findEvdevController(yNorth)
+		dev, err := findEvdevController(yNorth, debug)
 		if err != nil {
 			log.Println("Waiting for controller (evdev)...")
 			time.Sleep(2 * time.Second)
@@ -391,6 +432,7 @@ func runClient(serverAddr string, yNorth bool) error {
 func main() {
 	serverAddr := flag.String("server", fmt.Sprintf("localhost:%d", DEFAULT_PORT), "Server address")
 	yNorth := flag.Bool("y-north", true, "Swap X/Y mapping to make Y act as North (Python-compatible)")
+	debugEvents := flag.Bool("debug-events", false, "Log raw evdev button/axis events to help map controller inputs")
 	flag.Parse()
 
 	if flag.NArg() > 0 {
@@ -403,7 +445,7 @@ func main() {
 	log.Printf("Connecting to %s (Ctrl+C to stop)", *serverAddr)
 
 	for {
-		if err := runClient(*serverAddr, *yNorth); err != nil {
+		if err := runClient(*serverAddr, *yNorth, *debugEvents); err != nil {
 			log.Printf("Connection error: %v", err)
 		}
 		time.Sleep(3 * time.Second)

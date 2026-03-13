@@ -87,6 +87,8 @@ func DefaultConfig() *ByteConfig {
 			{
 				Type: "bits",
 				Bits: []BitMapping{
+					{Pos: 1, Field: "SELECT"},
+					{Pos: 3, Field: "START"},
 					{Pos: 5, Field: "LB"},
 					{Pos: 6, Field: "RB"},
 					{Pos: 7, Field: "N"},
