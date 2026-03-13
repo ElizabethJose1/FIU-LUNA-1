@@ -9,6 +9,8 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"go.bug.st/serial"
@@ -21,6 +23,7 @@ const (
 
 // ControllerState matches client state
 type ControllerState struct {
+	Source       string `json:"source,omitempty"`
 	North        uint8 `json:"N"`
 	East         uint8 `json:"E"`
 	South        uint8 `json:"S"`
@@ -40,6 +43,27 @@ type ControllerState struct {
 	DPadX        int8  `json:"dX"`
 	DPadY        int8  `json:"dY"`
 	Timestamp    int64 `json:"ts"`
+}
+
+type StatusPacket struct {
+	Type      string `json:"type"`
+	Source    string `json:"source"`
+	Message   string `json:"message"`
+	Timestamp int64  `json:"ts"`
+}
+
+func (c *ControllerState) String() string {
+	source := c.Source
+	if source == "" {
+		source = "unknown"
+	}
+	return fmt.Sprintf("Source:%s Btns[N:%d E:%d S:%d W:%d LB:%d RB:%d SEL:%d START:%d] Joy[LX:%d LY:%d RX:%d RY:%d] Trig[L:%d R:%d] DPad[%d,%d]",
+		source,
+		c.North, c.East, c.South, c.West,
+		c.LeftBumper, c.RightBumper, c.Select, c.Start,
+		c.LeftX, c.LeftY, c.RightX, c.RightY,
+		c.LeftTrigger, c.RightTrigger,
+		c.DPadX, c.DPadY)
 }
 
 // ByteFormatter handles conversion from controller state to Arduino bytes
@@ -223,19 +247,125 @@ func openArduino(device string) (serial.Port, error) {
 	return port, nil
 }
 
+type SerialManager struct {
+	mu              sync.Mutex
+	port            serial.Port
+	appendCRC       bool
+	expectAck       bool
+	debugOnly       bool
+	lastOpenFailure time.Time
+	device          string
+}
+
+func NewSerialManager(device string, appendCRC bool, expectAck bool) *SerialManager {
+	port, err := openArduino(device)
+	if err != nil {
+		log.Printf("Arduino not connected: %v (debug mode)", err)
+		return &SerialManager{
+			appendCRC: appendCRC,
+			expectAck: expectAck,
+			debugOnly: true,
+			device:    device,
+		}
+	}
+
+	log.Println("Arduino connected")
+	return &SerialManager{
+		port:      port,
+		appendCRC: appendCRC,
+		expectAck: expectAck,
+		device:    device,
+	}
+}
+
+func (m *SerialManager) Close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.port != nil {
+		_ = m.port.Close()
+		m.port = nil
+	}
+}
+
+func (m *SerialManager) reconnectLocked() {
+	if time.Since(m.lastOpenFailure) < 2*time.Second {
+		return
+	}
+	m.lastOpenFailure = time.Now()
+	port, err := openArduino(m.device)
+	if err != nil {
+		log.Printf("Arduino reconnect failed: %v", err)
+		m.debugOnly = true
+		return
+	}
+	m.port = port
+	m.debugOnly = false
+	log.Println("Arduino reconnected")
+}
+
+func (m *SerialManager) Write(source string, data []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.port == nil {
+		m.reconnectLocked()
+		if m.port == nil {
+			return
+		}
+	}
+
+	out := data
+	if m.appendCRC {
+		out = AppendCRC(data)
+	}
+	if err := writeAll(m.port, out); err != nil {
+		log.Printf("Arduino write error from %s: %v", source, err)
+		_ = m.port.Close()
+		m.port = nil
+		m.debugOnly = true
+		return
+	}
+
+	if m.expectAck {
+		ack := make([]byte, 1)
+		n, err := m.port.Read(ack)
+		if err != nil {
+			log.Printf("Arduino ack read error from %s: %v", source, err)
+		} else if n == 0 {
+			log.Printf("Arduino ack timeout from %s", source)
+		} else if ack[0] != 0x06 {
+			log.Printf("Unexpected Arduino ack from %s: 0x%02X", source, ack[0])
+		}
+	}
+}
+
+func formatBytes(data []byte) string {
+	parts := make([]string, 0, len(data))
+	for _, b := range data {
+		parts = append(parts, fmt.Sprintf("%02X", b))
+	}
+	return strings.Join(parts, " ")
+}
+
+func tryParseStatusPacket(payload []byte) (*StatusPacket, bool) {
+	var pkt StatusPacket
+	if err := json.Unmarshal(payload, &pkt); err != nil {
+		return nil, false
+	}
+	if pkt.Type != "status" {
+		return nil, false
+	}
+	if pkt.Source == "" {
+		pkt.Source = "unknown"
+	}
+	return &pkt, true
+}
+
 // handleClient processes client connection
-func handleClient(conn net.Conn, formatter *ByteFormatter, serialAppendCRC bool, serialAck bool, serialDevice string) {
+func handleClient(conn net.Conn, formatter *ByteFormatter, serialMgr *SerialManager) {
 	defer conn.Close()
 
 	log.Printf("Client connected: %s", conn.RemoteAddr())
-
-	arduino, err := openArduino(serialDevice)
-	if err != nil {
-		log.Printf("Arduino not connected: %v (debug mode)", err)
-	} else {
-		defer arduino.Close()
-		log.Println("Arduino connected")
-	}
 
 	lastPrint := time.Now()
 
@@ -277,10 +407,18 @@ func handleClient(conn net.Conn, formatter *ByteFormatter, serialAppendCRC bool,
 			continue
 		}
 
+		if status, ok := tryParseStatusPacket(payload); ok {
+			fmt.Printf("[%s] Status: %s\n", status.Source, status.Message)
+			continue
+		}
+
 		var state ControllerState
 		if err := json.Unmarshal(payload, &state); err != nil {
 			log.Printf("JSON unmarshal error: %v", err)
 			continue
+		}
+		if state.Source == "" {
+			state.Source = conn.RemoteAddr().String()
 		}
 
 		// Format to Arduino bytes
@@ -288,44 +426,12 @@ func handleClient(conn net.Conn, formatter *ByteFormatter, serialAppendCRC bool,
 
 		// Debug print every second
 		if time.Since(lastPrint) > time.Second {
-			fmt.Printf("State: %v\n", &state)
-			fmt.Printf("Arduino bytes: [")
-			for i, b := range data {
-				if i > 0 {
-					fmt.Printf(" ")
-				}
-				fmt.Printf("%02X", b)
-			}
-			fmt.Printf("]\n")
+			fmt.Printf("[%s] State: %v\n", state.Source, &state)
+			fmt.Printf("[%s] Arduino bytes: [%s]\n", state.Source, formatBytes(data))
 			lastPrint = time.Now()
 		}
 
-		// Send to Arduino (optionally append CRC and optionally expect ACK)
-		if arduino != nil {
-			out := data
-			if serialAppendCRC {
-				out = AppendCRC(data)
-			}
-			if err := writeAll(arduino, out); err != nil {
-				log.Printf("Arduino write error: %v", err)
-				arduino.Close()
-				arduino = nil
-				continue
-			}
-
-			if serialAck {
-				// read one-byte ACK (0x06) with the port's read timeout
-				ack := make([]byte, 1)
-				n, err := arduino.Read(ack)
-				if err != nil {
-					log.Printf("Arduino ack read error: %v", err)
-				} else if n == 0 {
-					log.Printf("Arduino ack timeout (no data)")
-				} else if ack[0] != 0x06 {
-					log.Printf("Unexpected Arduino ack: 0x%02X", ack[0])
-				}
-			}
-		}
+		serialMgr.Write(state.Source, data)
 	}
 }
 
@@ -382,6 +488,8 @@ func main() {
 	defer listener.Close()
 
 	log.Printf("Server listening on %s", addr)
+	serialMgr := NewSerialManager(*serialDevice, *serialCRC, *serialAck)
+	defer serialMgr.Close()
 
 	// Accept connections
 	for {
@@ -391,9 +499,8 @@ func main() {
 			continue
 		}
 
-		// open Arduino per-connection so each handler can manage reconnects
-		go func(c net.Conn, dev string) {
-			handleClient(c, formatter, *serialCRC, *serialAck, dev)
-		}(conn, *serialDevice)
+		go func(c net.Conn) {
+			handleClient(c, formatter, serialMgr)
+		}(conn)
 	}
 }

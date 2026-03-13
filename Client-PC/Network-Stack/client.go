@@ -63,6 +63,7 @@ const (
 
 // ControllerState holds all controller inputs (same as your original)
 type ControllerState struct {
+	Source       string `json:"source,omitempty"`
 	North       uint8 `json:"N"`
 	East        uint8 `json:"E"`
 	South       uint8 `json:"S"`
@@ -87,7 +88,12 @@ type ControllerState struct {
 }
 
 func (c *ControllerState) String() string {
-	return fmt.Sprintf("Btns[N:%d E:%d S:%d W:%d LB:%d RB:%d SEL:%d START:%d] Joy[LX:%d LY:%d RX:%d RY:%d] Trig[L:%d R:%d] DPad[%d,%d]",
+	source := c.Source
+	if source == "" {
+		source = "pc"
+	}
+	return fmt.Sprintf("Source:%s Btns[N:%d E:%d S:%d W:%d LB:%d RB:%d SEL:%d START:%d] Joy[LX:%d LY:%d RX:%d RY:%d] Trig[L:%d R:%d] DPad[%d,%d]",
+		source,
 		c.North, c.East, c.South, c.West,
 		c.LeftBumper, c.RightBumper, c.Select, c.Start,
 		c.LeftX, c.LeftY, c.RightX, c.RightY,
@@ -262,6 +268,7 @@ func readController(dev *evdevDevice, conn net.Conn) error {
 	defer ticker.Stop()
 
 	state := &ControllerState{
+		Source: "pc",
 		LeftX:  127, LeftY: 127,
 		RightX: 127, RightY: 127,
 	}
