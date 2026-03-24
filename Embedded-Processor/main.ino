@@ -3,6 +3,112 @@
 Servo esc1;
 Servo esc2;
 
+constexpr byte START_BYTE = 0b10101000;
+constexpr byte END_BYTE = 0b00010101;
+constexpr byte start_byte_bm = 0b11111111;
+constexpr byte end_byte_bm = 0b11111111;
+
+constexpr uint8_t PACKET_SIZE = 5;        // start + 4 data bytes
+constexpr uint8_t PACKET_TOTAL_SIZE = 6;  // start + 4 data bytes + end
+constexpr size_t BUFFER_SIZE = 64;
+
+struct ControlPacket {
+  byte start_byte = 0;
+  byte joy_left_x = 0;
+  byte joy_left_y = 0;
+  byte joy_right_y = 0;
+  byte trigger = 0;
+  byte end_byte = 0;
+
+  byte barr[BUFFER_SIZE] = {0};
+  int sizeOfBarr = 0;
+
+  bool isStartByte(byte v) {
+    return (v & start_byte_bm) == START_BYTE;
+  }
+
+  bool isEndByte(byte v) {
+    return (v & end_byte_bm) == END_BYTE;
+  }
+
+  int32_t update() {
+    byte tempBarr[PACKET_TOTAL_SIZE] = {0};
+    int32_t result = Serial.readBytes(tempBarr, PACKET_TOTAL_SIZE);
+
+    if (result <= 0) {
+      return -1;
+    }
+
+    if (sizeOfBarr + result > static_cast<int>(BUFFER_SIZE)) {
+      sizeOfBarr = 0;
+      memset(barr, 0, sizeof(barr));
+      return -1;
+    }
+
+    for (int i = 0; i < result; i++) {
+      barr[sizeOfBarr + i] = tempBarr[i];
+    }
+    sizeOfBarr += result;
+
+    if (sizeOfBarr < PACKET_TOTAL_SIZE) {
+      return -1;
+    }
+
+    bool foundPacket = false;
+    int packetStartIndex = -1;
+
+    for (int i = 0; i <= (sizeOfBarr - PACKET_TOTAL_SIZE); i++) {
+      if (isStartByte(barr[i]) && isEndByte(barr[i + PACKET_SIZE])) {
+        foundPacket = true;
+        packetStartIndex = i;
+        break;
+      }
+    }
+
+    if (!foundPacket) {
+      // Keep only the last possible frame prefix to avoid unbounded growth.
+      int keepFrom = sizeOfBarr - (PACKET_TOTAL_SIZE - 1);
+      if (keepFrom < 0) {
+        keepFrom = 0;
+      }
+      int newSize = sizeOfBarr - keepFrom;
+      for (int i = 0; i < newSize; i++) {
+        barr[i] = barr[keepFrom + i];
+      }
+      for (int i = newSize; i < sizeOfBarr; i++) {
+        barr[i] = 0;
+      }
+      sizeOfBarr = newSize;
+      return -1;
+    }
+
+    for (int i = 0; i < PACKET_TOTAL_SIZE; i++) {
+      tempBarr[i] = barr[packetStartIndex + i];
+    }
+
+    int consumed = packetStartIndex + PACKET_TOTAL_SIZE;
+    int remaining = sizeOfBarr - consumed;
+    for (int i = 0; i < remaining; i++) {
+      barr[i] = barr[consumed + i];
+    }
+    for (int i = remaining; i < sizeOfBarr; i++) {
+      barr[i] = 0;
+    }
+    sizeOfBarr = remaining;
+
+    this->start_byte = tempBarr[0];
+    this->joy_left_x = tempBarr[1];
+    this->joy_left_y = tempBarr[2];
+    this->joy_right_y = tempBarr[3];
+    this->trigger = tempBarr[4];
+    this->end_byte = tempBarr[5];
+
+    return result;
+  }
+};
+
+ControlPacket controllerPacket;
+
 int escPin1 = 9;
 int escPin2 = 10;
 int linAcc1 = 11;
@@ -24,6 +130,10 @@ void setup() {
   // pinMode(button3,INPUT);
   // pinMode(button4,INPUT);
   Serial.begin(9600);
+  pinMode(linAcc1, OUTPUT);
+  pinMode(linAcc2, OUTPUT);
+  pinMode(dir1, OUTPUT);
+  pinMode(dir2, OUTPUT);
 
   esc1.attach(escPin1, throttleMin, throttleMax);
   esc2.attach(escPin2, throttleMin, throttleMax);
@@ -37,43 +147,23 @@ void setup() {
 }
 
 void loop() {
-  // Check if we have enough bytes for a full packet
-  if (Serial.available() >= 6) {
-    // Look for the start byte
-    if (Serial.read() == 0b10101000) {
-      byte packet[4];
-      Serial.readBytes(packet, 4); // Read the 4 data bytes
+  if (Serial.available() >= PACKET_TOTAL_SIZE && controllerPacket.update() > 0) {
+    int throttle = map(controllerPacket.joy_left_y, 0, 255, 1000, 2000);
+    esc1.writeMicroseconds(throttle);
+    esc2.writeMicroseconds(throttle);
 
-      // Check for the end byte
-      if (Serial.read() == 0b00010101) {
-        // Packet is valid, now parse the data bytes
-        byte ljoyX = packet[0];
-        byte ljoyY = packet[1];
-        byte rjoyY = packet[2];
-        byte rt = packet[3];
+    digitalWrite(linAcc1, controllerPacket.joy_right_y > 128 ? HIGH : LOW);
+    digitalWrite(linAcc2, controllerPacket.joy_right_y > 128 ? HIGH : LOW);
+    digitalWrite(dir1, controllerPacket.trigger > 128 ? HIGH : LOW);
+    digitalWrite(dir2, controllerPacket.trigger > 128 ? HIGH : LOW);
 
-        // Map Left Joystick Y-axis to throttle (0-255 -> 1000-2000)
-        int throttle = map(ljoyY, 0, 255, 1000, 2000);
-        esc1.writeMicroseconds(throttle);
-        esc2.writeMicroseconds(throttle);
-
-        // For now, let's use Right Joystick Y-axis for the linear actuators
-        // and Right Trigger for direction. This can be remapped later.
-        digitalWrite(linAcc1, rjoyY > 128 ? HIGH : LOW);
-        digitalWrite(linAcc2, rjoyY > 128 ? HIGH : LOW);
-        digitalWrite(dir1, rt > 128 ? HIGH : LOW);
-        digitalWrite(dir2, rt > 128 ? HIGH : LOW);
-
-        // Debug output
-        Serial.print("Throttle: ");
-        Serial.print(throttle);
-        Serial.print("  LJoyX: ");
-        Serial.print(ljoyX);
-        Serial.print("  RJoyY: ");
-        Serial.print(rjoyY);
-        Serial.print("  RT: ");
-        Serial.println(rt);
-      }
-    }
+    Serial.print("Throttle: ");
+    Serial.print(throttle);
+    Serial.print("  LJoyX: ");
+    Serial.print(controllerPacket.joy_left_x);
+    Serial.print("  RJoyY: ");
+    Serial.print(controllerPacket.joy_right_y);
+    Serial.print("  RT: ");
+    Serial.println(controllerPacket.trigger);
   }
 }
