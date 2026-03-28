@@ -1,8 +1,9 @@
-// client.go (Linux evdev version)
-// Reads /dev/input/event* and maps to ControllerState, then sends JSON+CRC with 4-byte length prefix.
+// Client-PC Network Stack
+// Reads Linux evdev controller input and sends controller state to the server
+// over TCP using a length-prefixed JSON+CRC32 protocol.
 //
-// Requires: go get golang.org/x/sys/unix
-// Run on Jetson/RPi/Linux (not Windows).
+// Wire format: [4-byte big-endian length][JSON payload][4-byte CRC32]
+// Requires Linux: go get golang.org/x/sys/unix
 
 package main
 
@@ -11,6 +12,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"log"
 	"net"
 	"os"
@@ -22,69 +24,79 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// ============================================================================
+// Constants
+// ============================================================================
+
 const (
-	DEFAULT_PORT = 8080
-	SEND_RATE_HZ = 33 // ~30ms between sends
+	DefaultPort = 8080
+	SendRateHz  = 33 // ~30ms between sends
 
 	// evdev event types
-	EV_KEY = 0x01
-	EV_ABS = 0x03
+	EvKey = 0x01
+	EvAbs = 0x03
 
-	// ABS axes (from linux input-event-codes.h, matches your Python mapping) :contentReference[oaicite:3]{index=3}
-	ABS_X     = 0x00
-	ABS_Y     = 0x01
-	ABS_Z     = 0x02
-	ABS_RX    = 0x03
-	ABS_RY    = 0x04
-	ABS_RZ    = 0x05
-	ABS_HAT0X = 0x10
-	ABS_HAT0Y = 0x11
-	ABS_GAS   = 0x09  // right trigger :contentReference[oaicite:4]{index=4}
-	ABS_BRAKE = 0x0A  // left trigger :contentReference[oaicite:5]{index=5}
+	// Analog axes (linux/input-event-codes.h)
+	AbsX     = 0x00
+	AbsY     = 0x01
+	AbsZ     = 0x02
+	AbsRX    = 0x03
+	AbsRY    = 0x04
+	AbsRZ    = 0x05
+	AbsGas   = 0x09 // right trigger
+	AbsBrake = 0x0A // left trigger
+	AbsHat0X = 0x10
+	AbsHat0Y = 0x11
 
-	// Buttons (typical gamepad codes; your Python maps these via ecodes) :contentReference[oaicite:6]{index=6}
-	BTN_SOUTH  = 0x130
-	BTN_EAST   = 0x131
-	BTN_NORTH  = 0x133
-	BTN_WEST   = 0x134
-	BTN_TL     = 0x136
-	BTN_TR     = 0x137
-	BTN_TL2    = 0x138
-	BTN_TR2    = 0x139
-	BTN_SELECT = 0x13a
-	BTN_START  = 0x13b
-	BTN_THUMBL = 0x13d
-	BTN_THUMBR = 0x13e
+	// Gamepad buttons (linux/input-event-codes.h)
+	BtnSouth  = 0x130
+	BtnEast   = 0x131
+	BtnNorth  = 0x133
+	BtnWest   = 0x134
+	BtnTL     = 0x136
+	BtnTR     = 0x137
+	BtnTL2    = 0x138
+	BtnTR2    = 0x139
+	BtnSelect = 0x13a
+	BtnStart  = 0x13b
+	BtnThumbL = 0x13d
+	BtnThumbR = 0x13e
 
-	// Some devices expose X/Y explicitly; Python swaps BTN_X/BTN_Y when y_north=True :contentReference[oaicite:7]{index=7}
-	BTN_X = 0x133 // often same as BTN_NORTH on some mappings; kept for optional swap logic
-	BTN_Y = 0x134 // often same as BTN_WEST on some mappings; kept for optional swap logic
+	// Aliases for X/Y swap logic when yNorth is enabled
+	BtnX = 0x133
+	BtnY = 0x134
 )
 
-// ControllerState holds all controller inputs (same as your original)
+// MaxPacketSize is the upper bound for a single JSON payload in bytes.
+var MaxPacketSize = 8192
+
+// ============================================================================
+// Types
+// ============================================================================
+
+// ControllerState holds all gamepad inputs sent to the server.
 type ControllerState struct {
 	Source       string `json:"source,omitempty"`
-	North       uint8 `json:"N"`
-	East        uint8 `json:"E"`
-	South       uint8 `json:"S"`
-	West        uint8 `json:"W"`
-	LeftBumper  uint8 `json:"LB"`
-	RightBumper uint8 `json:"RB"`
-	LeftStick   uint8 `json:"LS"`
-	RightStick  uint8 `json:"RS"`
-	Select      uint8 `json:"SELECT"`
-	Start       uint8 `json:"START"`
-
-	LeftX        uint8 `json:"LjoyX"`
-	LeftY        uint8 `json:"LjoyY"`
-	RightX       uint8 `json:"RjoyX"`
-	RightY       uint8 `json:"RjoyY"`
-	LeftTrigger  uint8 `json:"LT"`
-	RightTrigger uint8 `json:"RT"`
-	DPadX        int8  `json:"dX"`
-	DPadY        int8  `json:"dY"`
-
-	Timestamp int64 `json:"ts"`
+	North        uint8  `json:"N"`
+	East         uint8  `json:"E"`
+	South        uint8  `json:"S"`
+	West         uint8  `json:"W"`
+	LeftBumper   uint8  `json:"LB"`
+	RightBumper  uint8  `json:"RB"`
+	LeftStick    uint8  `json:"LS"`
+	RightStick   uint8  `json:"RS"`
+	Select       uint8  `json:"SELECT"`
+	Start        uint8  `json:"START"`
+	LeftX        uint8  `json:"LjoyX"`
+	LeftY        uint8  `json:"LjoyY"`
+	RightX       uint8  `json:"RjoyX"`
+	RightY       uint8  `json:"RjoyY"`
+	LeftTrigger  uint8  `json:"LT"`
+	RightTrigger uint8  `json:"RT"`
+	DPadX        int8   `json:"dX"`
+	DPadY        int8   `json:"dY"`
+	Timestamp    int64  `json:"ts"`
+	Seq          uint32 `json:"seq"`
 }
 
 func (c *ControllerState) String() string {
@@ -92,16 +104,19 @@ func (c *ControllerState) String() string {
 	if source == "" {
 		source = "pc"
 	}
-	return fmt.Sprintf("Source:%s Btns[N:%d E:%d S:%d W:%d LB:%d RB:%d SEL:%d START:%d] Joy[LX:%d LY:%d RX:%d RY:%d] Trig[L:%d R:%d] DPad[%d,%d]",
+	return fmt.Sprintf(
+		"Source:%s Btns[N:%d E:%d S:%d W:%d LB:%d RB:%d SEL:%d START:%d] "+
+			"Joy[LX:%d LY:%d RX:%d RY:%d] Trig[L:%d R:%d] DPad[%d,%d]",
 		source,
 		c.North, c.East, c.South, c.West,
 		c.LeftBumper, c.RightBumper, c.Select, c.Start,
 		c.LeftX, c.LeftY, c.RightX, c.RightY,
 		c.LeftTrigger, c.RightTrigger,
-		c.DPadX, c.DPadY)
+		c.DPadX, c.DPadY,
+	)
 }
 
-// Linux input_event (matches kernel struct layout)
+// inputEvent matches the Linux kernel struct input_event layout.
 type inputEvent struct {
 	Time  unix.Timeval
 	Type  uint16
@@ -109,7 +124,7 @@ type inputEvent struct {
 	Value int32
 }
 
-// ABS info from EVIOCGABS ioctl
+// absInfo holds axis calibration data from the EVIOCGABS ioctl.
 type absInfo struct {
 	Value      int32
 	Min        int32
@@ -119,25 +134,7 @@ type absInfo struct {
 	Resolution int32
 }
 
-// ioctl numbers (golang doesn't ship these for all arches; this one is stable for EVIOCGABS)
-func evioCGAbs(axis uint) uintptr {
-	// _IOR('E', 0x40 + axis, struct input_absinfo)
-	const (
-		iocRead  = 2
-		iocNrbits  = 8
-		iocTypebits = 8
-		iocSizebits = 14
-		iocDirshift  = iocNrbits + iocTypebits + iocSizebits
-		iocTypeshift = iocNrbits
-		iocSizeshift = iocNrbits + iocTypebits
-	)
-	// 'E' = 0x45
-	ioc := func(dir, typ, nr, size uintptr) uintptr {
-		return (dir << iocDirshift) | (typ << iocTypeshift) | (nr << 0) | (size << iocSizeshift)
-	}
-	return ioc(iocRead, 0x45, uintptr(0x40)+uintptr(axis), unsafe.Sizeof(absInfo{}))
-}
-
+// evdevDevice wraps a file descriptor to a /dev/input/event* node.
 type evdevDevice struct {
 	fd       int
 	path     string
@@ -146,21 +143,77 @@ type evdevDevice struct {
 	debug    bool
 }
 
-// normalize like your Python AxisEvent: ((value-min)/(max-min))*255 :contentReference[oaicite:8]{index=8}
-// DPad hats are NOT normalized (kept as -1/0/1) :contentReference[oaicite:9]{index=9}
+// ============================================================================
+// CRC (IEEE CRC-32)
+// ============================================================================
+
+func ComputeCRC(data []byte) uint32 {
+	return crc32.ChecksumIEEE(data)
+}
+
+// AppendCRC appends a 4-byte big-endian CRC32 to the payload.
+func AppendCRC(data []byte) []byte {
+	c := ComputeCRC(data)
+	out := make([]byte, len(data)+4)
+	copy(out, data)
+	binary.BigEndian.PutUint32(out[len(data):], c)
+	return out
+}
+
+// ============================================================================
+// TCP helpers
+// ============================================================================
+
+// writeAll writes the entire buffer to conn, handling partial writes.
+func writeAll(conn net.Conn, buf []byte) error {
+	written := 0
+	for written < len(buf) {
+		n, err := conn.Write(buf[written:])
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("tcp write returned 0 bytes")
+		}
+		written += n
+	}
+	return nil
+}
+
+// ============================================================================
+// evdev helpers
+// ============================================================================
+
+// evioCGAbs computes the ioctl number for EVIOCGABS(axis).
+func evioCGAbs(axis uint) uintptr {
+	const (
+		iocRead      = 2
+		iocNrbits    = 8
+		iocTypebits  = 8
+		iocSizebits  = 14
+		iocDirshift  = iocNrbits + iocTypebits + iocSizebits
+		iocTypeshift = iocNrbits
+		iocSizeshift = iocNrbits + iocTypebits
+	)
+	ioc := func(dir, typ, nr, size uintptr) uintptr {
+		return (dir << iocDirshift) | (typ << iocTypeshift) | (nr << 0) | (size << iocSizeshift)
+	}
+	return ioc(iocRead, 0x45, uintptr(0x40)+uintptr(axis), unsafe.Sizeof(absInfo{}))
+}
+
+// normalizeAbs maps a raw axis value to 0..255 using the device's min/max range.
+// Returns (0, false) for DPad hats which are handled separately.
 func (d *evdevDevice) normalizeAbs(code uint16, v int32) (uint8, bool) {
-	// DPad hat: pass-through mapping (-1/0/1) handled elsewhere
-	if code == ABS_HAT0X || code == ABS_HAT0Y {
+	if code == AbsHat0X || code == AbsHat0Y {
 		return 0, false
 	}
 
 	info, ok := d.absCache[code]
 	if !ok {
-		// try lazy query
 		var ai absInfo
 		_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(d.fd), evioCGAbs(uint(code)), uintptr(unsafe.Pointer(&ai)))
 		if errno != 0 {
-			return 127, true // fallback center
+			return 127, true
 		}
 		d.absCache[code] = ai
 		info = ai
@@ -194,21 +247,11 @@ func openEvdev(path string, yNorth bool, debug bool) (*evdevDevice, error) {
 	}, nil
 }
 
-func readDeviceName(path string) string {
-	base := filepath.Base(path)
-	namePath := filepath.Join("/sys/class/input", base, "device/name")
-	data, err := os.ReadFile(namePath)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
-}
-
 func (d *evdevDevice) close() {
 	_ = unix.Close(d.fd)
 }
 
-// readEvent reads one inputEvent (non-blocking)
+// readEvent reads one input event from the device (non-blocking).
 func (d *evdevDevice) readEvent() (inputEvent, bool, error) {
 	var ev inputEvent
 	buf := (*[unsafe.Sizeof(ev)]byte)(unsafe.Pointer(&ev))[:]
@@ -225,8 +268,18 @@ func (d *evdevDevice) readEvent() (inputEvent, bool, error) {
 	return ev, true, nil
 }
 
-// findEvdevController picks the first /dev/input/event* that can be opened.
-// (Barebones heuristic—good enough for first draft. You can tighten later.)
+// readDeviceName reads the human-friendly name from sysfs.
+func readDeviceName(path string) string {
+	base := filepath.Base(path)
+	namePath := filepath.Join("/sys/class/input", base, "device/name")
+	data, err := os.ReadFile(namePath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// findEvdevController opens the first available /dev/input/event* device.
 func findEvdevController(yNorth bool, debug bool) (*evdevDevice, error) {
 	paths, err := filepath.Glob("/dev/input/event*")
 	if err != nil || len(paths) == 0 {
@@ -247,25 +300,23 @@ func findEvdevController(yNorth bool, debug bool) (*evdevDevice, error) {
 	return nil, fmt.Errorf("could not open any /dev/input/event*")
 }
 
-func writeAll(conn net.Conn, buf []byte) error {
-	written := 0
-	for written < len(buf) {
-		n, err := conn.Write(buf[written:])
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return fmt.Errorf("tcp write returned 0 bytes")
-		}
-		written += n
-	}
-	return nil
-}
+// ============================================================================
+// Core logic
+// ============================================================================
 
-// readController maintains your same “ticker send loop”, but pulls freshest state from evdev
+// readController polls the evdev device and sends state to the server at SendRateHz.
 func readController(dev *evdevDevice, conn net.Conn) error {
-	ticker := time.NewTicker(time.Second / SEND_RATE_HZ)
+	ticker := time.NewTicker(time.Second / SendRateHz)
 	defer ticker.Stop()
+
+	var nextSeq uint32 = 1
+
+	sendLog, err := os.OpenFile("sent_packets.jsonl", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("Warning: could not open send log: %v", err)
+	} else {
+		defer sendLog.Close()
+	}
 
 	state := &ControllerState{
 		Source: "pc",
@@ -274,7 +325,7 @@ func readController(dev *evdevDevice, conn net.Conn) error {
 	}
 
 	for range ticker.C {
-		// Drain all pending events to update current state
+		// Drain all pending events to get the freshest state
 		for {
 			ev, ok, err := dev.readEvent()
 			if err != nil {
@@ -283,103 +334,13 @@ func readController(dev *evdevDevice, conn net.Conn) error {
 			if !ok {
 				break
 			}
-
-			switch ev.Type {
-			case EV_ABS:
-				code := uint16(ev.Code)
-				val := ev.Value
-
-				// DPad hats: keep -1/0/1 as in Python (not normalized) :contentReference[oaicite:10]{index=10}
-				if code == ABS_HAT0X {
-					if val < -1 {
-						val = -1
-					} else if val > 1 {
-						val = 1
-					}
-					state.DPadX = int8(val)
-					continue
-				}
-				if code == ABS_HAT0Y {
-					if val < -1 {
-						val = -1
-					} else if val > 1 {
-						val = 1
-					}
-					state.DPadY = int8(val)
-					continue
-				}
-
-				// Normalize analog axes to 0..255 like Python AxisEvent :contentReference[oaicite:11]{index=11}
-				norm, isAnalog := dev.normalizeAbs(code, val)
-				if !isAnalog {
-					continue
-				}
-				if dev.debug {
-					log.Printf("ABS code=0x%X value=%d norm=%d", code, val, norm)
-				}
-
-				switch code {
-				case ABS_X:
-					state.LeftX = norm
-				case ABS_Y:
-					state.LeftY = norm
-				case ABS_RX:
-					state.RightX = norm
-				case ABS_RY:
-					state.RightY = norm
-				case ABS_Z, ABS_BRAKE:
-					state.LeftTrigger = norm
-				case ABS_RZ, ABS_GAS:
-					state.RightTrigger = norm
-				}
-
-			case EV_KEY:
-				code := uint16(ev.Code)
-				pressed := uint8(0)
-				if ev.Value != 0 {
-					pressed = 1
-				}
-				if dev.debug {
-					log.Printf("KEY code=0x%X value=%d", code, ev.Value)
-				}
-
-				// Optional X/Y swap behavior like your Python ButtonEvent(y_north=True) :contentReference[oaicite:12]{index=12}
-				if dev.yNorth {
-					if code == BTN_X {
-						code = BTN_Y
-					} else if code == BTN_Y {
-						code = BTN_X
-					}
-				}
-
-				switch code {
-				case BTN_NORTH:
-					state.North = pressed
-				case BTN_EAST:
-					state.East = pressed
-				case BTN_SOUTH:
-					state.South = pressed
-				case BTN_WEST:
-					state.West = pressed
-				case BTN_TL:
-					state.LeftBumper = pressed
-				case BTN_TR:
-					state.RightBumper = pressed
-				case BTN_SELECT:
-					state.Select = pressed
-				case BTN_START:
-					state.Start = pressed
-				case BTN_THUMBL:
-					state.LeftStick = pressed
-				case BTN_THUMBR:
-					state.RightStick = pressed
-				}
-			}
+			applyEvent(dev, state, ev)
 		}
 
 		state.Timestamp = time.Now().UnixMilli()
+		state.Seq = nextSeq
+		nextSeq++
 
-		// Marshal + CRC + length-prefix (same as your existing pipeline)
 		b, err := json.Marshal(state)
 		if err != nil {
 			return fmt.Errorf("marshal state: %w", err)
@@ -390,6 +351,7 @@ func readController(dev *evdevDevice, conn net.Conn) error {
 		}
 
 		pkt := AppendCRC(b)
+		crc := binary.BigEndian.Uint32(pkt[len(b):])
 		hdr := make([]byte, 4)
 		binary.BigEndian.PutUint32(hdr, uint32(len(pkt)))
 
@@ -400,12 +362,112 @@ func readController(dev *evdevDevice, conn net.Conn) error {
 			return fmt.Errorf("write packet: %w", err)
 		}
 
+		if sendLog != nil {
+			fmt.Fprintf(sendLog, "{\"seq\":%d,\"crc32\":%d,\"sent_at\":%d}\n", state.Seq, crc, state.Timestamp)
+		}
+
 		fmt.Println(state)
 	}
 
 	return nil
 }
 
+// applyEvent updates the controller state from a single evdev event.
+func applyEvent(dev *evdevDevice, state *ControllerState, ev inputEvent) {
+	switch ev.Type {
+	case EvAbs:
+		code := uint16(ev.Code)
+		val := ev.Value
+
+		// DPad hats: clamp to -1/0/1
+		if code == AbsHat0X {
+			state.DPadX = clampHat(val)
+			return
+		}
+		if code == AbsHat0Y {
+			state.DPadY = clampHat(val)
+			return
+		}
+
+		// Analog axes: normalize to 0..255
+		norm, isAnalog := dev.normalizeAbs(code, val)
+		if !isAnalog {
+			return
+		}
+		if dev.debug {
+			log.Printf("ABS code=0x%X value=%d norm=%d", code, val, norm)
+		}
+
+		switch code {
+		case AbsX:
+			state.LeftX = norm
+		case AbsY:
+			state.LeftY = norm
+		case AbsRX:
+			state.RightX = norm
+		case AbsRY:
+			state.RightY = norm
+		case AbsZ, AbsBrake:
+			state.LeftTrigger = norm
+		case AbsRZ, AbsGas:
+			state.RightTrigger = norm
+		}
+
+	case EvKey:
+		code := uint16(ev.Code)
+		pressed := uint8(0)
+		if ev.Value != 0 {
+			pressed = 1
+		}
+		if dev.debug {
+			log.Printf("KEY code=0x%X value=%d", code, ev.Value)
+		}
+
+		// Swap X/Y when yNorth is enabled
+		if dev.yNorth {
+			if code == BtnX {
+				code = BtnY
+			} else if code == BtnY {
+				code = BtnX
+			}
+		}
+
+		switch code {
+		case BtnNorth:
+			state.North = pressed
+		case BtnEast:
+			state.East = pressed
+		case BtnSouth:
+			state.South = pressed
+		case BtnWest:
+			state.West = pressed
+		case BtnTL:
+			state.LeftBumper = pressed
+		case BtnTR:
+			state.RightBumper = pressed
+		case BtnSelect:
+			state.Select = pressed
+		case BtnStart:
+			state.Start = pressed
+		case BtnThumbL:
+			state.LeftStick = pressed
+		case BtnThumbR:
+			state.RightStick = pressed
+		}
+	}
+}
+
+func clampHat(val int32) int8 {
+	if val < -1 {
+		return -1
+	}
+	if val > 1 {
+		return 1
+	}
+	return int8(val)
+}
+
+// runClient connects to the server and streams controller state.
 func runClient(serverAddr string, yNorth bool, debug bool) error {
 	conn, err := net.Dial("tcp", serverAddr)
 	if err != nil {
@@ -436,17 +498,21 @@ func runClient(serverAddr string, yNorth bool, debug bool) error {
 	}
 }
 
+// ============================================================================
+// main
+// ============================================================================
+
 func main() {
-	serverAddr := flag.String("server", fmt.Sprintf("localhost:%d", DEFAULT_PORT), "Server address")
-	yNorth := flag.Bool("y-north", true, "Swap X/Y mapping to make Y act as North (Python-compatible)")
-	debugEvents := flag.Bool("debug-events", false, "Log raw evdev button/axis events to help map controller inputs")
+	serverAddr := flag.String("server", fmt.Sprintf("localhost:%d", DefaultPort), "Server address")
+	yNorth := flag.Bool("y-north", true, "Swap X/Y mapping so Y acts as North")
+	debugEvents := flag.Bool("debug-events", false, "Log raw evdev events for debugging")
 	flag.Parse()
 
 	if flag.NArg() > 0 {
 		*serverAddr = flag.Arg(0)
 	}
 	if !strings.Contains(*serverAddr, ":") {
-		*serverAddr = fmt.Sprintf("%s:%d", *serverAddr, DEFAULT_PORT)
+		*serverAddr = fmt.Sprintf("%s:%d", *serverAddr, DefaultPort)
 	}
 
 	log.Printf("Connecting to %s (Ctrl+C to stop)", *serverAddr)

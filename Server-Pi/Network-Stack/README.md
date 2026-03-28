@@ -1,98 +1,82 @@
-# FIU Lunabotics Controller System (Go Implementation)
+# Server-Pi Network Stack
 
-## Overview
-The **Lunabotics Controller System** is a real-time control and telemetry layer designed to connect a human-operated controller (e.g., DualShock 4) to the rover’s microcontroller through a modular and configurable communication interface.
+## What this is
 
-This folder focuses on the Server that runs on the Jetson (or other onboard computer). The server listens for framed JSON controller state packets, verifies CRC, maps the JSON to Arduino bytes using a configurable `ByteFormatter`, and writes bytes to the Arduino over serial.
+This is the server that runs on the **Raspberry Pi** onboard the rover. It
+listens for TCP connections from both the PC client (controller input) and the
+Jetson client (status heartbeats). Incoming packets are CRC-verified, logged in
+batches for debugging, and the controller state is formatted into bytes and
+forwarded to an Arduino over serial.
 
----
+## Wire format
 
-## Quick start — Server (Raspberry Pi)
+Same protocol as the clients:
 
-Build (on Pi or cross-compile):
-
-```bash
-cd Server-Pi
-go build -o server_bin .
-
-# or from repo root
-go build -o bin/Server-Pi ./Server-Pi
+```
+[4-byte big-endian length] [JSON payload] [4-byte CRC32]
 ```
 
-Run (example):
+- **Length** = size of (payload + CRC), not including the length prefix itself.
+- **CRC32** = IEEE CRC-32 computed over the JSON payload only.
+
+## How to build and run
 
 ```bash
-./server_bin -serial-device /dev/ttyACM0 -serial-crc
+cd Server-Pi/Network-Stack
+go build -o server .
+./server -port 8080 -serial-device /dev/ttyACM0
 ```
 
-### Server behavior
-- Location: `server.go` in this folder.
-- Purpose: listen for controller packets, verify CRC, format bytes and send to serial Arduino.
+## Flags
 
-- Default start (port 8080):
+| Flag              | Default              | Description                                |
+|-------------------|----------------------|--------------------------------------------|
+| `-port`           | `8080`               | TCP listen port                            |
+| `-public`         | `false`              | Bind to 0.0.0.0 instead of localhost       |
+| `-config`         | (built-in 6-byte)    | Path to byte-mapping JSON config           |
+| `-serial-device`  | `/dev/ttyACM0`       | Serial device path for Arduino             |
+| `-serial-crc`     | `false`              | Append CRC32 to serial writes              |
+| `-serial-ack`     | `false`              | Expect 0x06 ACK from Arduino after write   |
+| `-packet-log`     | `packet_errors.jsonl`| Path to packet error log                   |
 
-	go run server.go crc.go
+## Packet logging
 
-- To select a different port:
+Packets are grouped into batches of 10. If any packet in a batch has an error
+(CRC mismatch, JSON parse failure, size violation, or sequence gap), the entire
+batch is written to `packet_errors.jsonl`. Clean batches are silently discarded.
 
-	go run server.go crc.go -port 18080
+Each line in the log is one packet:
 
-- Behavior details:
-	- Reads framed packets from TCP: 4-byte big-endian length N, then N bytes (payload + 4-byte CRC).
-	- Verifies CRC before decoding JSON payload. If CRC fails, packet is dropped and logged.
-	- Converts verified ControllerState JSON into Arduino bytes using `ByteFormatter` and writes to serial (default `/dev/ttyACM0`) or logs in debug mode.
+```json
+{"seq":42,"crc32":3847261509,"received_at":1711612800030,"status":"OK"}
+{"seq":43,"crc32":0,"received_at":1711612800060,"status":"CRC_FAIL","raw_payload":"base64..."}
+```
 
----
+Batches are separated by a blank line.
 
-## CRC support (crc.go)
-- File: `crc.go` (included in this folder).
-- Algorithm: CRC-32 using polynomial 0x04C11DB7 (IEEE). Implemented using `crc32.ChecksumIEEE`.
-- API:
-	- `var MaxPacketSize` — maximum payload size in bytes (default 8192). Adjust as needed.
-	- `ComputeCRC([]byte) uint32` — compute CRC for a payload.
-	- `AppendCRC([]byte) []byte` — returns payload with 4 CRC bytes appended (big-endian).
-	- `VerifyPacket([]byte) (payload []byte, ok bool)` — given payload+crc, returns payload and whether CRC matched.
+## Byte config templates
 
-Server flags related to serial handling:
-- `-serial-device` : set serial device path (default `/dev/ttyACM0`).
-- `-serial-crc` : if set, the server will append a 4-byte CRC to the bytes written to the Arduino.
-- `-serial-ack` : if set, the server will expect a 1-byte ACK (0x06) from the Arduino after each write (uses serial port read timeout).
+The server converts `ControllerState` JSON into a fixed-length byte array for
+the Arduino. Two templates are included:
 
----
+- `byte_config.json` -- 6-byte format (default)
+- `byte_config_8byte.json` -- 8-byte extended format
 
-## ByteFormatter templates (configurable JSON)
-- The server converts JSON ControllerState into a fixed-length byte array for Arduino using `ByteFormatter` and a `ByteConfig`.
-- Config structure (high level):
-	- `output_size` (int): total bytes in the formatted packet.
-	- `bytes` (array): list of per-byte mappings. Each entry maps one output byte and has a `type` field.
+Use `-config <file>` to switch.
 
-Supported byte mapping types
-1) `const`
-	 - Fields: `value` (0-255)
-	 - Behavior: the output byte is the constant value.
+## Code structure
 
-2) `field`
-	 - Fields: `field` (string, name of ControllerState field)
-	 - Behavior: output byte = value of the named field (uint8 fields are used directly).
+`server.go` is organized in this order:
 
-3) `bits`
-	 - Fields: `bits` (array of `{pos, field}`)
-	 - Behavior: construct an output byte by setting bits at positions `pos` when the corresponding ControllerState `field` is non-zero.
-
-Default templates included in the repo root:
-- `byte_config.json` — a 6-byte Python-compatible format.
-- `byte_config_8byte.json` — an 8-byte extended format.
-
-Switching templates
-- Start server with `-config <file>` to load a different byte mapping config:
-
-	go run server.go crc.go -config byte_config_8byte.json
-
----
-
-## Notes & troubleshooting
-- Multi-binary layout: the client lives in `client-pc/` and contains a local `crc.go`. Both targets ship their own CRC helper and ByteFormatter usage; this keeps the deployments self-contained.
-- If `go run server.go` fails with port in use, pick another port with `-port`.
-- `MaxPacketSize` guards the server from very large or malicious packet lengths; increase it only if necessary.
-
-If you'd like the CRC and ByteFormatter code shared as a package instead of duplicated, I can refactor the repo to a shared `crc` package and a shared `byteformatter` package — tell me if you want that.
+1. **Constants** -- ports, baud rate, batch size
+2. **Types -- Protocol** -- `ControllerState`, `StatusPacket`
+3. **Types -- Byte Formatting** -- `ByteFormatter`, `ByteConfig`, mappings
+4. **Types -- Packet Logging** -- `PacketLog`, `Batch`, `BatchLogger`
+5. **Types -- Serial** -- `SerialManager`
+6. **CRC** -- `ComputeCRC`, `AppendCRC`, `VerifyPacket`
+7. **Byte Formatter** -- `DefaultConfig`, `Format`, `LoadConfig`
+8. **Batch Logger** -- `Record`, `flush`, `Close`
+9. **Serial Manager** -- `openArduino`, `Write`, reconnect logic
+10. **TCP helpers** -- `formatBytes`, `tryParseStatusPacket`
+11. **Client handler** -- `handleClient`
+12. **main**

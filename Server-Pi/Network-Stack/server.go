@@ -1,10 +1,19 @@
+// Server-Pi Network Stack
+// TCP server that receives controller state from clients, verifies CRC
+// integrity, logs packets in batches for debugging, and forwards formatted
+// bytes to an Arduino over serial.
+//
+// Wire format: [4-byte big-endian length][JSON payload][4-byte CRC32]
+
 package main
 
 import (
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"net"
@@ -16,40 +25,46 @@ import (
 	"go.bug.st/serial"
 )
 
+// ============================================================================
+// Constants
+// ============================================================================
+
 const (
-	ARDUINO_PORT = "/dev/ttyACM0"
-	BAUD_RATE    = 9600
+	ArduinoPort = "/dev/ttyACM0"
+	BaudRate    = 9600
+	BatchSize   = 10
 )
 
-// ControllerState matches client state
+// MaxPacketSize is the upper bound for a single JSON payload in bytes.
+var MaxPacketSize = 8192
+
+// ============================================================================
+// Types — Protocol
+// ============================================================================
+
+// ControllerState holds all gamepad inputs received from a client.
 type ControllerState struct {
 	Source       string `json:"source,omitempty"`
-	North        uint8 `json:"N"`
-	East         uint8 `json:"E"`
-	South        uint8 `json:"S"`
-	West         uint8 `json:"W"`
-	LeftBumper   uint8 `json:"LB"`
-	RightBumper  uint8 `json:"RB"`
-	LeftStick    uint8 `json:"LS"`
-	RightStick   uint8 `json:"RS"`
-	Select       uint8 `json:"SELECT"`
-	Start        uint8 `json:"START"`
-	LeftX        uint8 `json:"LjoyX"`
-	LeftY        uint8 `json:"LjoyY"`
-	RightX       uint8 `json:"RjoyX"`
-	RightY       uint8 `json:"RjoyY"`
-	LeftTrigger  uint8 `json:"LT"`
-	RightTrigger uint8 `json:"RT"`
-	DPadX        int8  `json:"dX"`
-	DPadY        int8  `json:"dY"`
-	Timestamp    int64 `json:"ts"`
-}
-
-type StatusPacket struct {
-	Type      string `json:"type"`
-	Source    string `json:"source"`
-	Message   string `json:"message"`
-	Timestamp int64  `json:"ts"`
+	North        uint8  `json:"N"`
+	East         uint8  `json:"E"`
+	South        uint8  `json:"S"`
+	West         uint8  `json:"W"`
+	LeftBumper   uint8  `json:"LB"`
+	RightBumper  uint8  `json:"RB"`
+	LeftStick    uint8  `json:"LS"`
+	RightStick   uint8  `json:"RS"`
+	Select       uint8  `json:"SELECT"`
+	Start        uint8  `json:"START"`
+	LeftX        uint8  `json:"LjoyX"`
+	LeftY        uint8  `json:"LjoyY"`
+	RightX       uint8  `json:"RjoyX"`
+	RightY       uint8  `json:"RjoyY"`
+	LeftTrigger  uint8  `json:"LT"`
+	RightTrigger uint8  `json:"RT"`
+	DPadX        int8   `json:"dX"`
+	DPadY        int8   `json:"dY"`
+	Timestamp    int64  `json:"ts"`
+	Seq          uint32 `json:"seq"`
 }
 
 func (c *ControllerState) String() string {
@@ -57,41 +72,139 @@ func (c *ControllerState) String() string {
 	if source == "" {
 		source = "unknown"
 	}
-	return fmt.Sprintf("Source:%s Btns[N:%d E:%d S:%d W:%d LB:%d RB:%d SEL:%d START:%d] Joy[LX:%d LY:%d RX:%d RY:%d] Trig[L:%d R:%d] DPad[%d,%d]",
+	return fmt.Sprintf(
+		"Source:%s Btns[N:%d E:%d S:%d W:%d LB:%d RB:%d SEL:%d START:%d] "+
+			"Joy[LX:%d LY:%d RX:%d RY:%d] Trig[L:%d R:%d] DPad[%d,%d]",
 		source,
 		c.North, c.East, c.South, c.West,
 		c.LeftBumper, c.RightBumper, c.Select, c.Start,
 		c.LeftX, c.LeftY, c.RightX, c.RightY,
 		c.LeftTrigger, c.RightTrigger,
-		c.DPadX, c.DPadY)
+		c.DPadX, c.DPadY,
+	)
 }
 
-// ByteFormatter handles conversion from controller state to Arduino bytes
+// StatusPacket is a lightweight message from Jetson clients.
+type StatusPacket struct {
+	Type      string `json:"type"`
+	Source    string `json:"source"`
+	Message   string `json:"message"`
+	Timestamp int64  `json:"ts"`
+}
+
+// ============================================================================
+// Types — Byte Formatting (controller state -> Arduino bytes)
+// ============================================================================
+
 type ByteFormatter struct {
 	Config *ByteConfig
 }
 
-// ByteConfig defines the byte mapping configuration
 type ByteConfig struct {
 	OutputSize int           `json:"output_size"`
 	Bytes      []ByteMapping `json:"bytes"`
 }
 
-// ByteMapping defines how each byte is constructed
 type ByteMapping struct {
-	Type  string       `json:"type"`            // "const", "field", "bits"
-	Value uint8        `json:"value,omitempty"` // For const
-	Field string       `json:"field,omitempty"` // For field mapping
-	Bits  []BitMapping `json:"bits,omitempty"`  // For bitmask
+	Type  string       `json:"type"`            // "const", "field", or "bits"
+	Value uint8        `json:"value,omitempty"` // for "const"
+	Field string       `json:"field,omitempty"` // for "field"
+	Bits  []BitMapping `json:"bits,omitempty"`  // for "bits"
 }
 
-// BitMapping maps a bit position to a field
 type BitMapping struct {
-	Pos   uint8  `json:"pos"`   // 0-7
-	Field string `json:"field"` // Field name from ControllerState
+	Pos   uint8  `json:"pos"`
+	Field string `json:"field"`
 }
 
-// DefaultConfig returns the Python-compatible 6-byte format
+// ============================================================================
+// Types — Packet Logging
+// ============================================================================
+
+type PacketStatus string
+
+const (
+	StatusOK        PacketStatus = "OK"
+	StatusCRCFail   PacketStatus = "CRC_FAIL"
+	StatusJSONError PacketStatus = "JSON_ERROR"
+	StatusSizeError PacketStatus = "SIZE_ERROR"
+)
+
+// PacketLog is one entry in the batch logger.
+type PacketLog struct {
+	Seq        uint32       `json:"seq"`
+	CRC32      uint32       `json:"crc32"`
+	ReceivedAt int64        `json:"received_at"`
+	Status     PacketStatus `json:"status"`
+	RawPayload string       `json:"raw_payload,omitempty"`
+}
+
+// Batch holds up to BatchSize packet log entries.
+type Batch struct {
+	Packets  [BatchSize]PacketLog
+	Count    int
+	HasError bool
+}
+
+// BatchLogger groups packets into batches of 10. Error-containing batches
+// are written to a JSONL file; clean batches are discarded.
+type BatchLogger struct {
+	mu        sync.Mutex
+	current   Batch
+	logFile   *os.File
+	lastSeq   uint32
+	seqInited bool
+}
+
+// ============================================================================
+// Types — Serial
+// ============================================================================
+
+// SerialManager handles the connection to the Arduino over serial.
+type SerialManager struct {
+	mu              sync.Mutex
+	port            serial.Port
+	appendCRC       bool
+	expectAck       bool
+	debugOnly       bool
+	lastOpenFailure time.Time
+	device          string
+}
+
+// ============================================================================
+// CRC (IEEE CRC-32)
+// ============================================================================
+
+func ComputeCRC(data []byte) uint32 {
+	return crc32.ChecksumIEEE(data)
+}
+
+// AppendCRC appends a 4-byte big-endian CRC32 to the payload.
+func AppendCRC(data []byte) []byte {
+	c := ComputeCRC(data)
+	out := make([]byte, len(data)+4)
+	copy(out, data)
+	binary.BigEndian.PutUint32(out[len(data):], c)
+	return out
+}
+
+// VerifyPacket splits payload+CRC, recomputes, and checks for a match.
+func VerifyPacket(payloadWithCRC []byte) (payload []byte, ok bool) {
+	if len(payloadWithCRC) < 4 {
+		return nil, false
+	}
+	payloadLen := len(payloadWithCRC) - 4
+	payload = make([]byte, payloadLen)
+	copy(payload, payloadWithCRC[:payloadLen])
+	expected := binary.BigEndian.Uint32(payloadWithCRC[payloadLen:])
+	return payload, ComputeCRC(payload) == expected
+}
+
+// ============================================================================
+// Byte Formatter
+// ============================================================================
+
+// DefaultConfig returns the 6-byte Arduino format.
 func DefaultConfig() *ByteConfig {
 	return &ByteConfig{
 		OutputSize: 6,
@@ -122,20 +235,18 @@ func DefaultConfig() *ByteConfig {
 	}
 }
 
-// Format converts controller state to Arduino bytes
+// Format converts a ControllerState into Arduino bytes per the config.
 func (f *ByteFormatter) Format(state *ControllerState) []byte {
 	if f.Config == nil {
 		f.Config = DefaultConfig()
 	}
 
-	// Pre-fill with Python-compatible start/end bytes
 	output := make([]byte, f.Config.OutputSize)
 	if f.Config.OutputSize == 6 {
-		output[0] = 0b10101000 // Default start byte
-		output[5] = 0b00010101 // Default end byte
+		output[0] = 0b10101000 // start byte
+		output[5] = 0b00010101 // end byte
 	}
 
-	// Build each byte according to config
 	for i, byteMap := range f.Config.Bytes {
 		if i >= len(output) {
 			break
@@ -151,8 +262,7 @@ func (f *ByteFormatter) Format(state *ControllerState) []byte {
 		case "bits":
 			var b uint8
 			if f.Config.OutputSize == 6 && (i == 0 || i == 5) {
-				// Preserve default bits for Python compatibility
-				b = output[i]
+				b = output[i] // preserve start/end byte defaults
 			}
 			for _, bit := range byteMap.Bits {
 				if f.getFieldValue(state, bit.Field) != 0 {
@@ -166,7 +276,7 @@ func (f *ByteFormatter) Format(state *ControllerState) []byte {
 	return output
 }
 
-// getFieldValue gets value from state by field name
+// getFieldValue reads a named field from the controller state.
 func (f *ByteFormatter) getFieldValue(state *ControllerState, field string) uint8 {
 	switch field {
 	case "N":
@@ -210,51 +320,109 @@ func (f *ByteFormatter) getFieldValue(state *ControllerState, field string) uint
 	}
 }
 
-// LoadConfig loads configuration from file
+// LoadConfig reads a byte-mapping config from a JSON file.
 func LoadConfig(filename string) (*ByteConfig, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
-
 	var config ByteConfig
 	if err := json.Unmarshal(data, &config); err != nil {
 		return nil, err
 	}
-
 	return &config, nil
 }
 
-// openArduino opens serial connection
-// openArduino opens serial connection to the given device path.
+// ============================================================================
+// Batch Logger
+// ============================================================================
+
+func NewBatchLogger(path string) (*BatchLogger, error) {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("open packet log: %w", err)
+	}
+	return &BatchLogger{logFile: f}, nil
+}
+
+// Record adds a packet to the current batch. Flushes when the batch is full.
+func (bl *BatchLogger) Record(entry PacketLog) {
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+
+	// Detect sequence gaps
+	if bl.seqInited && entry.Seq != 0 && entry.Seq != bl.lastSeq+1 {
+		bl.current.HasError = true
+		log.Printf("Sequence gap: expected %d, got %d", bl.lastSeq+1, entry.Seq)
+	}
+	if entry.Seq != 0 {
+		bl.lastSeq = entry.Seq
+		bl.seqInited = true
+	}
+
+	if entry.Status != StatusOK {
+		bl.current.HasError = true
+	}
+
+	bl.current.Packets[bl.current.Count] = entry
+	bl.current.Count++
+
+	if bl.current.Count >= BatchSize {
+		bl.flush()
+	}
+}
+
+// flush writes the current batch to disk if it contains errors, then resets.
+func (bl *BatchLogger) flush() {
+	if bl.current.HasError {
+		enc := json.NewEncoder(bl.logFile)
+		for i := 0; i < bl.current.Count; i++ {
+			enc.Encode(bl.current.Packets[i])
+		}
+		bl.logFile.WriteString("\n") // batch separator
+	}
+	bl.current = Batch{}
+}
+
+// Close flushes any partial error batch and closes the log file.
+func (bl *BatchLogger) Close() {
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+
+	if bl.current.Count > 0 && bl.current.HasError {
+		bl.flush()
+	}
+	bl.logFile.Close()
+}
+
+// NewErrorLog builds a PacketLog for failed packets, base64-encoding raw bytes.
+func NewErrorLog(status PacketStatus, rawBytes []byte) PacketLog {
+	return PacketLog{
+		Status:     status,
+		RawPayload: base64.StdEncoding.EncodeToString(rawBytes),
+	}
+}
+
+// ============================================================================
+// Serial Manager
+// ============================================================================
+
 func openArduino(device string) (serial.Port, error) {
 	if device == "" {
-		device = ARDUINO_PORT
+		device = ArduinoPort
 	}
 	mode := &serial.Mode{
-		BaudRate: BAUD_RATE,
+		BaudRate: BaudRate,
 		DataBits: 8,
 		StopBits: serial.OneStopBit,
 		Parity:   serial.NoParity,
 	}
-
 	port, err := serial.Open(device, mode)
 	if err != nil {
 		return nil, err
 	}
-
 	port.SetReadTimeout(100 * time.Millisecond)
 	return port, nil
-}
-
-type SerialManager struct {
-	mu              sync.Mutex
-	port            serial.Port
-	appendCRC       bool
-	expectAck       bool
-	debugOnly       bool
-	lastOpenFailure time.Time
-	device          string
 }
 
 func NewSerialManager(device string, appendCRC bool, expectAck bool) *SerialManager {
@@ -303,6 +471,7 @@ func (m *SerialManager) reconnectLocked() {
 	log.Println("Arduino reconnected")
 }
 
+// Write sends formatted bytes to the Arduino, reconnecting if needed.
 func (m *SerialManager) Write(source string, data []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -318,7 +487,7 @@ func (m *SerialManager) Write(source string, data []byte) {
 	if m.appendCRC {
 		out = AppendCRC(data)
 	}
-	if err := writeAll(m.port, out); err != nil {
+	if err := serialWriteAll(m.port, out); err != nil {
 		log.Printf("Arduino write error from %s: %v", source, err)
 		_ = m.port.Close()
 		m.port = nil
@@ -338,6 +507,26 @@ func (m *SerialManager) Write(source string, data []byte) {
 		}
 	}
 }
+
+// serialWriteAll writes the full buffer to the serial port, handling partial writes.
+func serialWriteAll(port serial.Port, buf []byte) error {
+	written := 0
+	for written < len(buf) {
+		n, err := port.Write(buf[written:])
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("serial write returned 0 bytes")
+		}
+		written += n
+	}
+	return nil
+}
+
+// ============================================================================
+// TCP helpers
+// ============================================================================
 
 func formatBytes(data []byte) string {
 	parts := make([]string, 0, len(data))
@@ -361,15 +550,29 @@ func tryParseStatusPacket(payload []byte) (*StatusPacket, bool) {
 	return &pkt, true
 }
 
-// handleClient processes client connection
-func handleClient(conn net.Conn, formatter *ByteFormatter, serialMgr *SerialManager) {
+// ============================================================================
+// Client handler
+// ============================================================================
+
+// handleClient reads packets from a single TCP connection, verifies CRC,
+// logs them through the batch logger, and forwards to the Arduino.
+func handleClient(conn net.Conn, formatter *ByteFormatter, serialMgr *SerialManager, logPath string) {
 	defer conn.Close()
 
 	log.Printf("Client connected: %s", conn.RemoteAddr())
 
+	batchLog, err := NewBatchLogger(logPath)
+	if err != nil {
+		log.Printf("Failed to open packet log: %v", err)
+		return
+	}
+	defer batchLog.Close()
+
 	lastPrint := time.Now()
 
 	for {
+		receivedAt := time.Now().UnixMilli()
+
 		// Read 4-byte length prefix
 		hdr := make([]byte, 4)
 		if _, err := io.ReadFull(conn, hdr); err != nil {
@@ -381,13 +584,16 @@ func handleClient(conn net.Conn, formatter *ByteFormatter, serialMgr *SerialMana
 			return
 		}
 		totalLen := binary.BigEndian.Uint32(hdr)
+
+		// Validate packet size
 		if totalLen == 0 {
 			log.Printf("Zero-length packet, skipping")
+			batchLog.Record(PacketLog{ReceivedAt: receivedAt, Status: StatusSizeError, RawPayload: "size=0"})
 			continue
 		}
-		if totalLen > uint32(MaxPacketSize+4) { // payload + crc shouldn't exceed MaxPacketSize+4
+		if totalLen > uint32(MaxPacketSize+4) {
 			log.Printf("Packet too large: %d bytes (max %d)", totalLen, MaxPacketSize+4)
-			// Drain and continue (attempt to read and discard)
+			batchLog.Record(PacketLog{ReceivedAt: receivedAt, Status: StatusSizeError, RawPayload: fmt.Sprintf("size=%d", totalLen)})
 			if _, err := io.CopyN(io.Discard, conn, int64(totalLen)); err != nil {
 				log.Printf("drain error: %v", err)
 				return
@@ -395,36 +601,54 @@ func handleClient(conn net.Conn, formatter *ByteFormatter, serialMgr *SerialMana
 			continue
 		}
 
+		// Read full packet (payload + CRC)
 		buf := make([]byte, totalLen)
 		if _, err := io.ReadFull(conn, buf); err != nil {
 			log.Printf("Read packet error: %v", err)
 			return
 		}
 
+		// Extract the CRC from the wire for logging
+		var wireCRC uint32
+		if len(buf) >= 4 {
+			wireCRC = binary.BigEndian.Uint32(buf[len(buf)-4:])
+		}
+
+		// Verify CRC
 		payload, ok := VerifyPacket(buf)
 		if !ok {
 			log.Printf("CRC mismatch from %s, dropping packet", conn.RemoteAddr())
+			entry := NewErrorLog(StatusCRCFail, buf)
+			entry.CRC32 = wireCRC
+			entry.ReceivedAt = receivedAt
+			batchLog.Record(entry)
 			continue
 		}
 
+		// Handle status packets (from Jetson)
 		if status, ok := tryParseStatusPacket(payload); ok {
 			fmt.Printf("[%s] Status: %s\n", status.Source, status.Message)
+			batchLog.Record(PacketLog{CRC32: wireCRC, ReceivedAt: receivedAt, Status: StatusOK})
 			continue
 		}
 
+		// Parse controller state
 		var state ControllerState
 		if err := json.Unmarshal(payload, &state); err != nil {
 			log.Printf("JSON unmarshal error: %v", err)
+			batchLog.Record(PacketLog{CRC32: wireCRC, ReceivedAt: receivedAt, Status: StatusJSONError, RawPayload: string(payload)})
 			continue
 		}
 		if state.Source == "" {
 			state.Source = conn.RemoteAddr().String()
 		}
 
-		// Format to Arduino bytes
+		// Log successful packet
+		batchLog.Record(PacketLog{Seq: state.Seq, CRC32: wireCRC, ReceivedAt: receivedAt, Status: StatusOK})
+
+		// Format and send to Arduino
 		data := formatter.Format(&state)
 
-		// Debug print every second
 		if time.Since(lastPrint) > time.Second {
 			fmt.Printf("[%s] State: %v\n", state.Source, &state)
 			fmt.Printf("[%s] Arduino bytes: [%s]\n", state.Source, formatBytes(data))
@@ -435,32 +659,21 @@ func handleClient(conn net.Conn, formatter *ByteFormatter, serialMgr *SerialMana
 	}
 }
 
-// writeAll writes the full buffer to the serial port, handling partial writes.
-func writeAll(port serial.Port, buf []byte) error {
-	written := 0
-	for written < len(buf) {
-		n, err := port.Write(buf[written:])
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return fmt.Errorf("serial write returned 0 bytes")
-		}
-		written += n
-	}
-	return nil
-}
+// ============================================================================
+// main
+// ============================================================================
 
 func main() {
 	port := flag.Int("port", 8080, "Server port")
 	public := flag.Bool("public", false, "Allow external connections")
 	configFile := flag.String("config", "", "Byte mapping config file")
 	serialCRC := flag.Bool("serial-crc", false, "Append CRC32 to bytes sent over serial")
-	serialAck := flag.Bool("serial-ack", false, "Expect 1-byte ACK (0x06) from serial device after each packet")
-	serialDevice := flag.String("serial-device", ARDUINO_PORT, "Serial device path to write to (overrides ARDUINO_PORT)")
+	serialAck := flag.Bool("serial-ack", false, "Expect 1-byte ACK (0x06) from Arduino after each write")
+	serialDevice := flag.String("serial-device", ArduinoPort, "Serial device path")
+	packetLog := flag.String("packet-log", "packet_errors.jsonl", "Path to packet error log file")
 	flag.Parse()
 
-	// Load configuration
+	// Load byte-mapping config
 	formatter := &ByteFormatter{}
 	if *configFile != "" {
 		config, err := LoadConfig(*configFile)
@@ -475,7 +688,7 @@ func main() {
 		log.Println("Using default 6-byte format")
 	}
 
-	// Setup listener
+	// Start TCP listener
 	addr := fmt.Sprintf("localhost:%d", *port)
 	if *public {
 		addr = fmt.Sprintf("0.0.0.0:%d", *port)
@@ -491,16 +704,15 @@ func main() {
 	serialMgr := NewSerialManager(*serialDevice, *serialCRC, *serialAck)
 	defer serialMgr.Close()
 
-	// Accept connections
+	// Accept client connections
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			log.Printf("Accept error: %v", err)
 			continue
 		}
-
 		go func(c net.Conn) {
-			handleClient(c, formatter, serialMgr)
+			handleClient(c, formatter, serialMgr, *packetLog)
 		}(conn)
 	}
 }
