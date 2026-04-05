@@ -168,7 +168,7 @@ func AppendCRC(data []byte) []byte {
 func writeAll(conn net.Conn, buf []byte) error {
 	written := 0
 	for written < len(buf) {
-		n, err := conn.Write(buf[written:])
+		n, err := conn.Write(buf[written:]) //part of the buffer is successfully written witn n value
 		if err != nil {
 			return err
 		}
@@ -208,7 +208,7 @@ func (d *evdevDevice) normalizeAbs(code uint16, v int32) (uint8, bool) {
 		return 0, false
 	}
 
-	info, ok := d.absCache[code]
+	info, ok := d.absCache[code] //sroes the axis info
 	if !ok {
 		var ai absInfo
 		_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(d.fd), evioCGAbs(uint(code)), uintptr(unsafe.Pointer(&ai)))
