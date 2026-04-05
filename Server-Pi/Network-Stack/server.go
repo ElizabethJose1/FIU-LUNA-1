@@ -18,6 +18,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,11 @@ const (
 	ArduinoPort = "/dev/ttyACM0"
 	BaudRate    = 9600
 	BatchSize   = 10
+
+	// The rover state machine publishes its latest mode here for Method 2 gating.
+	roverStateFilePath = "/tmp/rover_state"
+	// Treat stale state as unsafe so controller packets cannot move the rover.
+	roverStateMaxAge = 2 * time.Second
 )
 
 // MaxPacketSize is the upper bound for a single JSON payload in bytes.
@@ -550,6 +556,56 @@ func tryParseStatusPacket(payload []byte) (*StatusPacket, bool) {
 	return &pkt, true
 }
 
+// readRoverState loads the latest rover mode and timestamp published by Rover/main.c.
+func readRoverState() (string, int64, bool) {
+
+	roverData, err := os.ReadFile(roverStateFilePath)
+	if err != nil {
+		return "", 0, false
+	}
+
+	cleanData := strings.TrimSpace(string(roverData))
+	stateParts := strings.SplitN(cleanData, ",", 2)
+
+	if len(stateParts) != 2 {
+		log.Printf("invalid rover state format: %q", cleanData)
+		return "", 0, false
+	}
+
+	stateName := strings.TrimSpace(stateParts[0])
+
+	switch stateName {
+	case "IDLE", "TELEOP", "AUTO":
+	default:
+		log.Printf("Unknown rover state: %q", stateName)
+		return "", 0, false
+	}
+
+	stateTimestamp, err := strconv.ParseInt(strings.TrimSpace(stateParts[1]), 10, 64)
+	if err != nil || stateTimestamp <= 0 {
+		log.Printf("invalid rover timestamp: %q", stateParts[1])
+		return "", 0, false
+	}
+	return stateName, stateTimestamp, true
+}
+
+// Only TELEOP is allowed to forward controller bytes to the Arduino.
+func validRoverState(stateName string) bool {
+	switch stateName {
+	case "TELEOP":
+		return true
+	default:
+		return false
+	}
+
+}
+
+// Reject stale rover state so an old TELEOP file cannot keep motion enabled.
+func newRoverState(stateTimestamp int64) bool {
+	age := time.Now().UnixMilli() - stateTimestamp
+	return age >= 0 && age <= roverStateMaxAge.Milliseconds()
+}
+
 // ============================================================================
 // Client handler
 // ============================================================================
@@ -648,6 +704,26 @@ func handleClient(conn net.Conn, formatter *ByteFormatter, serialMgr *SerialMana
 
 		// Format and send to Arduino
 		data := formatter.Format(&state)
+
+		// Method 2: keep the serial port available, but gate each write on rover state.
+		stateName, stateTimestamp, ok := readRoverState()
+
+		if !ok {
+			log.Println("Rover state unavailable, skipping serial write")
+			continue
+		}
+
+		if !newRoverState(stateTimestamp) {
+			log.Printf("stale rover state for %s, skipping serial write", stateName)
+			continue
+		}
+
+		if !validRoverState(stateName) {
+
+			log.Printf("Rover state %s blocks serial write", stateName)
+			continue
+
+		}
 
 		if time.Since(lastPrint) > time.Second {
 			fmt.Printf("[%s] State: %v\n", state.Source, &state)
