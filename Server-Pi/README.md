@@ -8,6 +8,8 @@ controller bytes to the Arduino.
 - The serial port can stay open.
 - Every controller packet is still received and parsed by `Network-Stack/server.go`.
 - Before each serial write, the server reads `/tmp/rover_state`.
+- The server can also publish controller-driven state change requests to
+  `/tmp/rover_state_request`.
 - Serial writes are only allowed when the rover state is `TELEOP`.
 - `IDLE`, `AUTO`, missing state data, malformed state data, and stale state data
   all block the serial write.
@@ -34,6 +36,21 @@ TELEOP,1775358012435
 
 Each transition updates `/tmp/rover_state`, which is what the Go server uses
 for Method 2 gating.
+
+## Controller State Requests
+
+The network stack can now request rover state changes from controller packets.
+The intended mapping is:
+
+- hold `SELECT` (`SCB`) for at least 0.5s
+- while still holding it:
+  - `Y / N` -> `TELEOP`
+  - `B / E` -> `AUTO`
+  - `X / W` -> `IDLE`
+
+The Go server writes one-shot requests to `/tmp/rover_state_request`, and
+`Rover/main.c` consumes that file in its main loop before updating
+`/tmp/rover_state`.
 
 ## Quick Test Flow
 

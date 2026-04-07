@@ -4,6 +4,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <inttypes.h>
+#include <string.h>
 #include <sys/select.h> // lets us poll stdin without blocking the state loop
 
 
@@ -18,10 +19,12 @@ long stateStartTime = 0;
 long lastPrintTime = 0;
 
 const long printInterval = 2500; // how often to print the remaining time in milliseconds, in this case every second
+const char *stateRequestPath = "/tmp/rover_state_request";
 
 // Forward declare changeState because the input helper can trigger transitions.
 
 void changeState(enum RoverState newState);
+void pollStateRequest(void);
 
 long millis() {
   struct timespec ts;
@@ -80,6 +83,30 @@ void pollStateInput(void) {
   for (ssize_t i = 0; i < bytesRead; i++) {
     handleStateCommand(inputBuffer[i]);
   }
+}
+
+void pollStateRequest(void) {
+  FILE *requestFile = fopen(stateRequestPath, "r");
+  if (requestFile == NULL) {
+    return;
+  }
+
+  char line[128];
+  if (fgets(line, sizeof(line), requestFile) != NULL) {
+    char *modeToken = strtok(line, ",\n\r");
+    if (modeToken != NULL) {
+      if (strcmp(modeToken, "IDLE") == 0) {
+        changeState(IDLE);
+      } else if (strcmp(modeToken, "TELEOP") == 0) {
+        changeState(TELEOP);
+      } else if (strcmp(modeToken, "AUTO") == 0) {
+        changeState(AUTO);
+      }
+    }
+  }
+
+  fclose(requestFile);
+  unlink(stateRequestPath);
 }
 
 void changeState(enum RoverState newState){ // newState is just another instance for the rover state in function that is used in this function to change the state
@@ -144,6 +171,7 @@ void loop() {
   long now = millis(); //how long the program has been running minus the time when the state started which atp is 0 with stateStartTime updated every time the state changes.
   // Poll once per loop so state transitions can be triggered interactively.
   pollStateInput();
+  pollStateRequest();
 
   switch(currentState){
     case IDLE:

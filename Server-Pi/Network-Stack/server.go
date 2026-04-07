@@ -36,9 +36,11 @@ const (
 	BatchSize   = 10
 
 	// The rover state machine publishes its latest mode here for Method 2 gating.
-	roverStateFilePath = "/tmp/rover_state"
+	roverStateFilePath        = "/tmp/rover_state"
+	roverStateRequestFilePath = "/tmp/rover_state_request"
 	// Treat stale state as unsafe so controller packets cannot move the rover.
 	roverStateMaxAge = 2 * time.Second
+	stateChangeHoldDuration = 500 * time.Millisecond
 )
 
 // MaxPacketSize is the upper bound for a single JSON payload in bytes.
@@ -177,6 +179,12 @@ type SerialManager struct {
 	device          string
 }
 
+// StateSwitchTracker debounces SCB-hold state changes from the controller.
+type StateSwitchTracker struct {
+	selectHeldSince time.Time
+	requestIssued   bool
+}
+
 // ============================================================================
 // CRC (IEEE CRC-32)
 // ============================================================================
@@ -210,33 +218,41 @@ func VerifyPacket(payloadWithCRC []byte) (payload []byte, ok bool) {
 // Byte Formatter
 // ============================================================================
 
-// DefaultConfig returns the 6-byte Arduino format.
+// DefaultConfig returns the current 8-byte Arduino format.
 func DefaultConfig() *ByteConfig {
 	return &ByteConfig{
-		OutputSize: 6,
+		OutputSize: 8,
 		Bytes: []ByteMapping{
+			{Type: "const", Value: 0xFF},
 			{
 				Type: "bits",
 				Bits: []BitMapping{
-					{Pos: 0, Field: "W"},
+					{Pos: 0, Field: "N"},
 					{Pos: 1, Field: "E"},
 					{Pos: 2, Field: "S"},
+					{Pos: 3, Field: "W"},
+					{Pos: 4, Field: "LB"},
+					{Pos: 5, Field: "RB"},
+					{Pos: 6, Field: "SELECT"},
+					{Pos: 7, Field: "START"},
 				},
 			},
-			{Type: "field", Field: "LjoyX"},
-			{Type: "field", Field: "LjoyY"},
-			{Type: "field", Field: "RjoyY"},
-			{Type: "field", Field: "RT"},
 			{
 				Type: "bits",
 				Bits: []BitMapping{
-					{Pos: 1, Field: "SELECT"},
-					{Pos: 3, Field: "START"},
-					{Pos: 5, Field: "LB"},
-					{Pos: 6, Field: "RB"},
-					{Pos: 7, Field: "N"},
+					{Pos: 0, Field: "LS"},
+					{Pos: 1, Field: "RS"},
+					{Pos: 2, Field: "dX_POS"},
+					{Pos: 3, Field: "dX_NEG"},
+					{Pos: 4, Field: "dY_NEG"},
+					{Pos: 5, Field: "dY_POS"},
 				},
 			},
+			{Type: "field", Field: "LjoyY"},
+			{Type: "field", Field: "RjoyY"},
+			{Type: "field", Field: "LT"},
+			{Type: "field", Field: "RT"},
+			{Type: "const", Value: 0xFF},
 		},
 	}
 }
@@ -321,6 +337,36 @@ func (f *ByteFormatter) getFieldValue(state *ControllerState, field string) uint
 		return uint8(state.DPadX)
 	case "dY":
 		return uint8(state.DPadY)
+	case "dX_POS":
+		if state.DPadX > 0 {
+			return 1
+		}
+		return 0
+	case "dX_NEG":
+		if state.DPadX < 0 {
+			return 1
+		}
+		return 0
+	case "dY_POS":
+		if state.DPadY > 0 {
+			return 1
+		}
+		return 0
+	case "dY_NEG":
+		if state.DPadY < 0 {
+			return 1
+		}
+		return 0
+	case "LT_ACTIVE":
+		if state.LeftTrigger > 10 {
+			return 1
+		}
+		return 0
+	case "RT_ACTIVE":
+		if state.RightTrigger > 10 {
+			return 1
+		}
+		return 0
 	default:
 		return 0
 	}
@@ -589,6 +635,74 @@ func readRoverState() (string, int64, bool) {
 	return stateName, stateTimestamp, true
 }
 
+func controllerRequestedMode(state *ControllerState) (string, bool) {
+	switch {
+	case state.North != 0:
+		return "TELEOP", true
+	case state.East != 0:
+		return "AUTO", true
+	case state.West != 0:
+		return "IDLE", true
+	default:
+		return "", false
+	}
+}
+
+func writeStateRequest(mode string, timestamp int64, source string, seq uint32) error {
+	tmpPath := roverStateRequestFilePath + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+
+	if _, err := fmt.Fprintf(f, "%s,%d,%s,%d\n", mode, timestamp, source, seq); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, roverStateRequestFilePath)
+}
+
+func (t *StateSwitchTracker) Handle(state *ControllerState) (string, bool, error) {
+	if state.Select == 0 {
+		t.selectHeldSince = time.Time{}
+		t.requestIssued = false
+		return "", false, nil
+	}
+
+	if t.selectHeldSince.IsZero() {
+		t.selectHeldSince = time.Now()
+		return "", false, nil
+	}
+
+	if t.requestIssued || time.Since(t.selectHeldSince) < stateChangeHoldDuration {
+		return "", false, nil
+	}
+
+	mode, ok := controllerRequestedMode(state)
+	if !ok {
+		return "", false, nil
+	}
+
+	source := state.Source
+	if source == "" {
+		source = "pc"
+	}
+
+	if err := writeStateRequest(mode, time.Now().UnixMilli(), source, state.Seq); err != nil {
+		return "", false, err
+	}
+
+	t.requestIssued = true
+	return mode, true, nil
+}
+
 // Only TELEOP is allowed to forward controller bytes to the Arduino.
 func validRoverState(stateName string) bool {
 	switch stateName {
@@ -625,6 +739,7 @@ func handleClient(conn net.Conn, formatter *ByteFormatter, serialMgr *SerialMana
 	defer batchLog.Close()
 
 	lastPrint := time.Now()
+	switchTracker := &StateSwitchTracker{}
 
 	for {
 		receivedAt := time.Now().UnixMilli()
@@ -702,6 +817,12 @@ func handleClient(conn net.Conn, formatter *ByteFormatter, serialMgr *SerialMana
 		// Log successful packet
 		batchLog.Record(PacketLog{Seq: state.Seq, CRC32: wireCRC, ReceivedAt: receivedAt, Status: StatusOK})
 
+		if mode, changed, err := switchTracker.Handle(&state); err != nil {
+			log.Printf("State request write failed from %s: %v", state.Source, err)
+		} else if changed {
+			log.Printf("[%s] queued rover state request: %s (seq=%d)", state.Source, mode, state.Seq)
+		}
+
 		// Format and send to Arduino
 		data := formatter.Format(&state)
 
@@ -761,7 +882,7 @@ func main() {
 		}
 	} else {
 		formatter.Config = DefaultConfig()
-		log.Println("Using default 6-byte format")
+		log.Println("Using default 8-byte format")
 	}
 
 	// Start TCP listener

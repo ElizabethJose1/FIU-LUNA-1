@@ -19,8 +19,15 @@
       ]
     },
     {
-      "type": "field",
-      "field": "LjoyX"
+      "type": "bits",
+      "bits": [
+        {"pos": 0, "field": "LS"},
+        {"pos": 1, "field": "RS"},
+        {"pos": 2, "field": "dX_POS"},
+        {"pos": 3, "field": "dX_NEG"},
+        {"pos": 4, "field": "dY_NEG"},
+        {"pos": 5, "field": "dY_POS"}
+      ]
     },
     {
       "type": "field",
@@ -28,11 +35,11 @@
     },
     {
       "type": "field",
-      "field": "RjoyX"
+      "field": "RjoyY"
     },
     {
       "type": "field",
-      "field": "RjoyY"
+      "field": "LT"
     },
     {
       "type": "field",
