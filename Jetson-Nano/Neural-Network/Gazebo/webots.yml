@@ -1,4 +1,0 @@
-publish: true
-type: demo
-dockerCompose: theia:FIU-LUNABOTICS/controllers/
-

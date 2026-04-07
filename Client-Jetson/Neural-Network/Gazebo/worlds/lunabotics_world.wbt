@@ -1,0 +1,296 @@
+#VRML_SIM R2023b utf8
+
+WorldInfo {
+  basicTimeStep 16
+  gravity 0 -9.81 0
+  title "Lunabotics Field"
+}
+
+Viewpoint {
+  orientation -0.5 0.4 0.75 1.5
+  position 6 6 4
+  description "Main View"
+}
+
+TexturedBackground {
+}
+
+TexturedBackgroundLight {
+}
+
+DirectionalLight {
+  direction -0.5 -0.5 -1
+  intensity 1
+  castShadows TRUE
+}
+
+# ============ TERRAIN ============
+DEF TERRAIN Solid {
+  translation 0 0 0
+  children [
+    DEF TERRAIN_SHAPE Shape {
+      appearance PBRAppearance {
+        baseColor 0.55 0.52 0.47
+        roughness 1
+      }
+      geometry Box {
+        size 6.8 5.0 0.3
+      }
+    }
+  ]
+  name "terrain"
+  boundingObject USE TERRAIN_SHAPE
+  physics Physics {
+    density -1
+    mass 1000
+  }
+}
+
+# ============ WALLS ============
+# North wall
+DEF NORTH_WALL Solid {
+  translation 0 2.5 0.25
+  children [
+    DEF NORTH_WALL_SHAPE Shape {
+      appearance PBRAppearance {
+        baseColor 0.7 0.7 0.7
+      }
+      geometry Box {
+        size 6.8 0.1 0.5
+      }
+    }
+  ]
+  name "north_wall"
+  boundingObject USE NORTH_WALL_SHAPE
+}
+
+# South wall
+DEF SOUTH_WALL Solid {
+  translation 0 -2.5 0.25
+  children [
+    DEF SOUTH_WALL_SHAPE Shape {
+      appearance PBRAppearance {
+        baseColor 0.7 0.7 0.7
+      }
+      geometry Box {
+        size 6.8 0.1 0.5
+      }
+    }
+  ]
+  name "south_wall"
+  boundingObject USE SOUTH_WALL_SHAPE
+}
+
+# East wall
+DEF EAST_WALL Solid {
+  translation 3.4 0 0.25
+  children [
+    DEF EAST_WALL_SHAPE Shape {
+      appearance PBRAppearance {
+        baseColor 0.7 0.7 0.7
+      }
+      geometry Box {
+        size 0.1 5.0 0.5
+      }
+    }
+  ]
+  name "east_wall"
+  boundingObject USE EAST_WALL_SHAPE
+}
+
+# West wall
+DEF WEST_WALL Solid {
+  translation -3.4 0 0.25
+  children [
+    DEF WEST_WALL_SHAPE Shape {
+      appearance PBRAppearance {
+        baseColor 0.7 0.7 0.7
+      }
+      geometry Box {
+        size 0.1 5.0 0.5
+      }
+    }
+  ]
+  name "west_wall"
+  boundingObject USE WEST_WALL_SHAPE
+}
+
+# ============ START ZONE ============
+DEF START_ZONE Solid {
+  translation -2.9 -1.9 0.16
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.1 0.8 0.1
+        transparency 0.4
+      }
+      geometry Box {
+        size 2.0 1.0 0.02
+      }
+    }
+  ]
+  name "start_zone"
+}
+
+# ============ BRIM PAD ============
+DEF BRIM_PAD Solid {
+  translation 2.4 1.8 0.16
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.9 0.8 0.1
+        transparency 0.4
+      }
+      geometry Box {
+        size 1.0 1.5 0.02
+      }
+    }
+  ]
+  name "brim_pad"
+}
+
+# ============ BRIM POLES ============
+# NE corner
+DEF POLE_NE Solid {
+  translation 2.9 2.55 0.6
+  children [
+    DEF POLE_SHAPE Shape {
+      appearance PBRAppearance {
+        baseColor 0.9 0.1 0.1
+      }
+      geometry Cylinder {
+        radius 0.03
+        height 1.2
+      }
+    }
+  ]
+  name "pole_ne"
+  boundingObject USE POLE_SHAPE
+}
+
+# NW corner
+DEF POLE_NW Solid {
+  translation 1.9 2.55 0.6
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.9 0.1 0.1
+      }
+      geometry Cylinder {
+        radius 0.03
+        height 1.2
+      }
+    }
+  ]
+  name "pole_nw"
+  boundingObject Cylinder {
+    radius 0.03
+    height 1.2
+  }
+}
+
+# SE corner
+DEF POLE_SE Solid {
+  translation 2.9 1.05 0.6
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.9 0.1 0.1
+      }
+      geometry Cylinder {
+        radius 0.03
+        height 1.2
+      }
+    }
+  ]
+  name "pole_se"
+  boundingObject Cylinder {
+    radius 0.03
+    height 1.2
+  }
+}
+
+# SW corner
+DEF POLE_SW Solid {
+  translation 1.9 1.05 0.6
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.9 0.1 0.1
+      }
+      geometry Cylinder {
+        radius 0.03
+        height 1.2
+      }
+    }
+  ]
+  name "pole_sw"
+  boundingObject Cylinder {
+    radius 0.03
+    height 1.2
+  }
+}
+
+# ============ ROCKS ============
+# Rock 1
+DEF ROCK_1 Solid {
+  translation -0.8 1.2 0.3
+  children [
+    DEF ROCK_1_SHAPE Shape {
+      appearance PBRAppearance {
+        baseColor 0.4 0.4 0.4
+        roughness 0.8
+      }
+      geometry Sphere {
+        radius 0.15
+      }
+    }
+  ]
+  name "rock_1"
+  boundingObject USE ROCK_1_SHAPE
+  physics Physics {
+    density 2500
+  }
+}
+
+# Rock 2
+DEF ROCK_2 Solid {
+  translation 1.1 -0.6 0.33
+  children [
+    DEF ROCK_2_SHAPE Shape {
+      appearance PBRAppearance {
+        baseColor 0.45 0.45 0.45
+        roughness 0.8
+      }
+      geometry Sphere {
+        radius 0.18
+      }
+    }
+  ]
+  name "rock_2"
+  boundingObject USE ROCK_2_SHAPE
+  physics Physics {
+    density 2500
+  }
+}
+
+# Rock 3
+DEF ROCK_3 Solid {
+  translation -2.0 0.3 0.35
+  children [
+    DEF ROCK_3_SHAPE Shape {
+      appearance PBRAppearance {
+        baseColor 0.35 0.35 0.35
+        roughness 0.8
+      }
+      geometry Sphere {
+        radius 0.20
+      }
+    }
+  ]
+  name "rock_3"
+  boundingObject USE ROCK_3_SHAPE
+  physics Physics {
+    density 2500
+  }
+}

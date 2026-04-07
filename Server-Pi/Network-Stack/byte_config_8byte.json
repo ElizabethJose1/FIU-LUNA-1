@@ -1,0 +1,53 @@
+{
+  "output_size": 8,
+  "bytes": [
+    {
+      "type": "const",
+      "value": 255
+    },
+    {
+      "type": "bits",
+      "bits": [
+        {"pos": 0, "field": "N"},
+        {"pos": 1, "field": "E"},
+        {"pos": 2, "field": "S"},
+        {"pos": 3, "field": "W"},
+        {"pos": 4, "field": "LB"},
+        {"pos": 5, "field": "RB"},
+        {"pos": 6, "field": "SELECT"},
+        {"pos": 7, "field": "START"}
+      ]
+    },
+    {
+      "type": "bits",
+      "bits": [
+        {"pos": 0, "field": "LS"},
+        {"pos": 1, "field": "RS"},
+        {"pos": 2, "field": "dX_POS"},
+        {"pos": 3, "field": "dX_NEG"},
+        {"pos": 4, "field": "dY_NEG"},
+        {"pos": 5, "field": "dY_POS"}
+      ]
+    },
+    {
+      "type": "field",
+      "field": "LjoyY"
+    },
+    {
+      "type": "field",
+      "field": "RjoyY"
+    },
+    {
+      "type": "field",
+      "field": "LT"
+    },
+    {
+      "type": "field",
+      "field": "RT"
+    },
+    {
+      "type": "const",
+      "value": 255
+    }
+  ]
+}
