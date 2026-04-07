@@ -38,9 +38,8 @@ Max packet size is 8192 bytes. CRC32 (IEEE) is computed over the JSON payload on
 - Configurable byte formatter converts `ControllerState` → Arduino byte array via JSON config
 - Serial output to Arduino at 9600 baud (`/dev/ttyACM0`), with optional CRC and ACK support
 
-**Byte Formatting** — Two config templates:
-- 6-byte (default): start marker + analog fields + button bits + end marker
-- 8-byte extended: full button bitfield + all analog axes + frame markers (0xFF)
+**Byte Formatting** — Current default config template:
+- 8-byte controller format: frame markers + primary buttons + secondary control bits + full analog stick axes
 
 ---
 
@@ -123,6 +122,63 @@ Replace `<PI_IP>` with the Raspberry Pi's IP address on your network.
 
 The client will scan for a gamepad on startup, connect to the server, and begin streaming controller state at ~33 Hz. If the connection drops, it retries every 3 seconds automatically.
 
+## GUI Dashboard
+
+The `motorControl` branch now includes a repo-owned GUI at `Client-PC/GUI`.
+It speaks the same framed JSON + CRC32 protocol as the Go services and can sit
+between the clients and the Pi server as a transparent monitor/proxy.
+
+Local one-machine test:
+
+```bash
+cd Client-PC/GUI
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python dashboard.py --listen-port 8090 --forward-to 127.0.0.1:8080
+```
+
+Then point the Go clients to the dashboard listener:
+
+```bash
+cd Client-PC/Network-Stack
+go run . -server 127.0.0.1:8090
+```
+
+```bash
+cd Client-Jetson/Network-Stack
+go run . -server 127.0.0.1:8090
+```
+
+Open the UI at `http://127.0.0.1:8050`.
+
+Remote Pi setup:
+
+Run the Go server on the Raspberry Pi:
+
+```bash
+cd Server-Pi/Network-Stack
+go run . -public -port 8080
+```
+
+Run the GUI on the operator PC and forward traffic to the Pi:
+
+```bash
+cd Client-PC/GUI
+python dashboard.py --listen-port 8090 --ui-port 8050 --forward-to <PI_IP>:8080
+```
+
+Run the PC gamepad client on the same operator PC:
+
+```bash
+cd Client-PC/Network-Stack
+go run . -server 127.0.0.1:8090
+```
+
+In this setup the client talks to the local GUI on `8090`, and the GUI forwards
+validated packets to the Raspberry Pi server on `<PI_IP>:8080`. Replace
+`<PI_IP>` with the Raspberry Pi's actual address on your network.
+
 ---
 
 ## Setting Up Server-Pi
@@ -138,7 +194,7 @@ go build -o server server.go
 |------|---------|-------------|
 | `-port` | `8080` | TCP listen port |
 | `-public` | `false` | Bind to 0.0.0.0 (required for remote clients) |
-| `-config` | *(built-in 6-byte)* | Path to byte-mapping JSON config |
+| `-config` | *(built-in 8-byte)* | Path to byte-mapping JSON config |
 | `-serial-device` | `/dev/ttyACM0` | Arduino serial port |
 | `-serial-crc` | `false` | Append CRC32 to serial data |
 | `-serial-ack` | `false` | Expect ACK (0x06) from Arduino |
@@ -158,4 +214,3 @@ go build -o jetsonclient client.go
 | `-source` | `jetson` | Source label in packets |
 | `-message` | `connected` | Status message |
 | `-hz` | `1` | Send rate in Hz |
-

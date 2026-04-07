@@ -8,6 +8,14 @@ Jetson client (status heartbeats). Incoming packets are CRC-verified, logged in
 batches for debugging, and the controller state is formatted into bytes and
 forwarded to an Arduino over serial.
 
+The server also detects controller-driven rover mode requests. Holding
+`SELECT` for at least 0.5s and then pressing a mapped face button writes a
+request file for the rover FSM:
+
+- `Y / N` -> `TELEOP`
+- `B / E` -> `AUTO`
+- `X / W` -> `IDLE`
+
 ## Wire format
 
 Same protocol as the clients:
@@ -33,7 +41,7 @@ go build -o server .
 |-------------------|----------------------|--------------------------------------------|
 | `-port`           | `8080`               | TCP listen port                            |
 | `-public`         | `false`              | Bind to 0.0.0.0 instead of localhost       |
-| `-config`         | (built-in 6-byte)    | Path to byte-mapping JSON config           |
+| `-config`         | (built-in 8-byte)    | Path to byte-mapping JSON config           |
 | `-serial-device`  | `/dev/ttyACM0`       | Serial device path for Arduino             |
 | `-serial-crc`     | `false`              | Append CRC32 to serial writes              |
 | `-serial-ack`     | `false`              | Expect 0x06 ACK from Arduino after write   |
@@ -57,10 +65,9 @@ Batches are separated by a blank line.
 ## Byte config templates
 
 The server converts `ControllerState` JSON into a fixed-length byte array for
-the Arduino. Two templates are included:
+the Arduino. The active/default template is:
 
-- `byte_config.json` -- 6-byte format (default)
-- `byte_config_8byte.json` -- 8-byte extended format
+- `byte_config_8byte.json` -- 8-byte controller format (default)
 
 Use `-config <file>` to switch.
 
