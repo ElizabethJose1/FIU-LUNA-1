@@ -2,8 +2,7 @@
 I served as a dual-lead on both the Electrical and Programming teams for the FIU Lunabotics robot. This prototype was engineered for the NASA Lunabotics Competition to excavate and transport simulated lunar regolith, supporting the broader goals of the NASA Artemis missions.
 
 ** My Technical Contributions **
-- Embedded Systems & Control (C / C++) :
-- Motor Control Logic: Developed the core C-based control program that interfaces with joystick input to drive the robot's motors via an Arduino.
+- Embedded Systems & Control (C / C++) : Motor Control Logic: Developed the core C-based control program that interfaces with joystick input to drive the robot's motors via an Arduino.
 
 State Machine Design: Contributed to the architectural design of the robot’s state machine, ensuring precise control over complex autonomous and manual behaviors.
 
