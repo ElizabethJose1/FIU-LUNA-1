@@ -1,3 +1,25 @@
+# My Contributions to FIU-Luna1
+I served as a dual-lead on both the Electrical and Programming teams for the FIU Lunabotics robot. This prototype was engineered for the NASA Lunabotics Competition to excavate and transport simulated lunar regolith, supporting the broader goals of the NASA Artemis missions.
+
+** My Technical Contributions **
+Embedded Systems & Control (C / C++) :
+Motor Control Logic: Developed the core C-based control program that interfaces with joystick input to drive the robot's motors via an Arduino.
+
+State Machine Design: Contributed to the architectural design of the robot’s state machine, ensuring precise control over complex autonomous and manual behaviors.
+
+System Integration: Managed communication protocols between the Jetson Nano, Raspberry Pi, and Arduino to ensure low-latency command execution.
+
+** Telemetry & Monitoring (Python) **
+Real-time Dashboard: Built a Python-based telemetry dashboard to visualize feedback from RPM and Hall sensors. This tool was critical for real-time performance monitoring and debugging hardware issues during test runs.
+
+** Electrical Engineering & Hardware **
+Hardware Integration: Researched and integrated motor systems to ensure maximum efficiency and compatibility with our custom control architecture.
+
+Collaboration: Acted as a bridge between the software and hardware teams to troubleshoot sensor interference and power distribution issues.
+
+** Reflection **
+This project has been an amazing oppotunity to work on both my technical and collaboration skills. I have gained so much knowledge in both embedded systems and software development. Getting to work alongside passionate engineers motivated me to work my hardest on the robot.
+
 # FIU-Luna1
 
 Distributed rover control system for the NASA Lunabotics competition. Three networked nodes work together: a **PC client** captures gamepad input, a **Jetson client** sends status heartbeats, and a **Raspberry Pi server** receives everything, formats it into byte arrays, and forwards commands to an Arduino over serial.
